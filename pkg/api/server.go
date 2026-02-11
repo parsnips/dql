@@ -49,6 +49,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.listTables(w, payload)
 	case "DeleteTable":
 		s.deleteTable(w, payload)
+	case "UpdateTable":
+		s.updateTable(w, payload)
 	case "PutItem":
 		s.putItem(w, payload)
 	case "GetItem":
@@ -157,6 +159,26 @@ func (s *Server) deleteTable(w http.ResponseWriter, payload []byte) {
 	}
 	_ = s.engine.DeleteTable(in.TableName)
 	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": map[string]any{"TableName": def.Name, "TableStatus": types.TableStatusActive}})
+}
+
+func (s *Server) updateTable(w http.ResponseWriter, payload []byte) {
+	var in struct {
+		TableName string `json:"TableName"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	if in.TableName == "" {
+		writeError(w, 400, "ValidationException", "TableName is required")
+		return
+	}
+	def, ok := s.catalog.Get(in.TableName)
+	if !ok {
+		writeError(w, 400, "ResourceNotFoundException", "Cannot do operations on a non-existent table")
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": map[string]any{"TableName": def.Name, "TableStatus": def.Status}})
 }
 
 func (s *Server) putItem(w http.ResponseWriter, payload []byte) {
