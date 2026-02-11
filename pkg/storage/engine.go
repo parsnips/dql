@@ -33,8 +33,19 @@ type Engine interface {
 	DeleteItem(table string, key map[string]types.AttributeValue) (map[string]types.AttributeValue, error)
 	DeleteItemConditional(table string, key map[string]types.AttributeValue, condition ConditionCheck) (map[string]types.AttributeValue, bool, error)
 	UpdateItemConditional(table string, key map[string]types.AttributeValue, condition ConditionCheck, update func(item map[string]types.AttributeValue) error) (map[string]types.AttributeValue, map[string]types.AttributeValue, bool, error)
+	TransactWriteItems(actions []TransactWriteAction) error
 	Query(table string, in QueryInput) (QueryOutput, error)
 	Scan(table string, in ScanInput) (ScanOutput, error)
+}
+
+type TransactWriteAction struct {
+	Table          string
+	PutItem        map[string]types.AttributeValue
+	DeleteKey      map[string]types.AttributeValue
+	UpdateKey      map[string]types.AttributeValue
+	ConditionKey   map[string]types.AttributeValue
+	Update         func(item map[string]types.AttributeValue) error
+	ConditionCheck ConditionCheck
 }
 
 type QueryInput struct {
@@ -219,6 +230,118 @@ func (m *MemoryEngine) UpdateItemConditional(table string, key map[string]types.
 	}
 	t.items[newKey] = cloneItem(working)
 	return old, cloneItem(working), true, nil
+}
+
+func (m *MemoryEngine) TransactWriteItems(actions []TransactWriteAction) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	working := make(map[string]*memTable, len(m.tables))
+	for name, tbl := range m.tables {
+		working[name] = cloneTable(tbl)
+	}
+
+	for _, action := range actions {
+		tableName := action.Table
+		if tableName == "" {
+			return fmt.Errorf("ValidationException: table name is required")
+		}
+		t, ok := working[tableName]
+		if !ok {
+			return fmt.Errorf("ResourceNotFoundException: table not found: %s", tableName)
+		}
+		schema := m.schemas[tableName]
+
+		if action.PutItem != nil {
+			k, err := makeKey(action.PutItem, schema)
+			if err != nil {
+				return err
+			}
+			existing := cloneItem(t.items[k])
+			if action.ConditionCheck != nil {
+				ok, err := action.ConditionCheck(cloneItem(existing))
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return fmt.Errorf("TransactionCanceledException: transaction cancelled due to conditional check failure")
+				}
+			}
+			t.items[k] = cloneItem(action.PutItem)
+			continue
+		}
+
+		if action.DeleteKey != nil {
+			k, err := makeKey(action.DeleteKey, schema)
+			if err != nil {
+				return err
+			}
+			existing := cloneItem(t.items[k])
+			if action.ConditionCheck != nil {
+				ok, err := action.ConditionCheck(cloneItem(existing))
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return fmt.Errorf("TransactionCanceledException: transaction cancelled due to conditional check failure")
+				}
+			}
+			delete(t.items, k)
+			continue
+		}
+
+		if action.UpdateKey != nil {
+			k, err := makeKey(action.UpdateKey, schema)
+			if err != nil {
+				return err
+			}
+			base := cloneItem(t.items[k])
+			if base == nil {
+				base = cloneItem(action.UpdateKey)
+			}
+			if action.ConditionCheck != nil {
+				ok, err := action.ConditionCheck(cloneItem(base))
+				if err != nil {
+					return err
+				}
+				if !ok {
+					return fmt.Errorf("TransactionCanceledException: transaction cancelled due to conditional check failure")
+				}
+			}
+			if action.Update != nil {
+				if err := action.Update(base); err != nil {
+					return err
+				}
+			}
+			newKey, err := makeKey(base, schema)
+			if err != nil {
+				return err
+			}
+			t.items[newKey] = cloneItem(base)
+			continue
+		}
+
+		if action.ConditionCheck != nil {
+			k, err := makeKey(action.ConditionKey, schema)
+			if err != nil {
+				return err
+			}
+			existing := cloneItem(t.items[k])
+			ok, err := action.ConditionCheck(cloneItem(existing))
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("TransactionCanceledException: transaction cancelled due to conditional check failure")
+			}
+			continue
+		}
+
+		return fmt.Errorf("ValidationException: transaction item is empty")
+	}
+
+	m.tables = working
+	return nil
 }
 
 func (m *MemoryEngine) Query(table string, in QueryInput) (QueryOutput, error) {
@@ -429,6 +552,17 @@ func cloneItem(in map[string]types.AttributeValue) map[string]types.AttributeVal
 	out := make(map[string]types.AttributeValue, len(in))
 	for k, v := range in {
 		out[k] = v
+	}
+	return out
+}
+
+func cloneTable(in *memTable) *memTable {
+	if in == nil {
+		return nil
+	}
+	out := &memTable{items: make(map[Key]map[string]types.AttributeValue, len(in.items))}
+	for key, item := range in.items {
+		out.items[key] = cloneItem(item)
 	}
 	return out
 }

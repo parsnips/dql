@@ -897,3 +897,178 @@ func TestConditionalUpdateItemIsAtomic(t *testing.T) {
 		}
 	}
 }
+
+func TestTransactWriteItemsSuccessAndRollback(t *testing.T) {
+	ctx := context.Background()
+	h := testutil.NewHarness(t)
+	client := h.Client
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("tx_items"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("tx_items"),
+		Item: map[string]types.AttributeValue{
+			"pk":      &types.AttributeValueMemberS{Value: "tenant#1"},
+			"sk":      &types.AttributeValueMemberS{Value: "item#1"},
+			"version": &types.AttributeValueMemberN{Value: "1"},
+			"status":  &types.AttributeValueMemberS{Value: "pending"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed put failed: %v", err)
+	}
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				ConditionCheck: &types.ConditionCheck{
+					TableName:           aws.String("tx_items"),
+					Key:                 map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#1"}},
+					ConditionExpression: aws.String("#v = :v"),
+					ExpressionAttributeNames: map[string]string{
+						"#v": "version",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":v": &types.AttributeValueMemberN{Value: "1"},
+					},
+				},
+			},
+			{
+				Update: &types.Update{
+					TableName:        aws.String("tx_items"),
+					Key:              map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#1"}},
+					UpdateExpression: aws.String("SET #s = :new, #v = :next"),
+					ExpressionAttributeNames: map[string]string{
+						"#s": "status",
+						"#v": "version",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":new":  &types.AttributeValueMemberS{Value: "committed"},
+						":next": &types.AttributeValueMemberN{Value: "2"},
+					},
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName: aws.String("tx_items"),
+					Item: map[string]types.AttributeValue{
+						"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":   &types.AttributeValueMemberS{Value: "item#2"},
+						"kind": &types.AttributeValueMemberS{Value: "audit"},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("transact write success path failed: %v", err)
+	}
+
+	updated, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String("tx_items"),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#1"}},
+	})
+	if err != nil {
+		t.Fatalf("get updated item failed: %v", err)
+	}
+	if got := updated.Item["status"].(*types.AttributeValueMemberS).Value; got != "committed" {
+		t.Fatalf("status got=%q want=%q", got, "committed")
+	}
+	if got := updated.Item["version"].(*types.AttributeValueMemberN).Value; got != "2" {
+		t.Fatalf("version got=%q want=%q", got, "2")
+	}
+
+	audit, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String("tx_items"),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#2"}},
+	})
+	if err != nil {
+		t.Fatalf("get second item failed: %v", err)
+	}
+	if audit.Item == nil {
+		t.Fatalf("expected second item to be created by transaction")
+	}
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				Update: &types.Update{
+					TableName:        aws.String("tx_items"),
+					Key:              map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#1"}},
+					UpdateExpression: aws.String("SET #s = :new"),
+					ExpressionAttributeNames: map[string]string{
+						"#s": "status",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":new": &types.AttributeValueMemberS{Value: "should-not-stick"},
+					},
+				},
+			},
+			{
+				ConditionCheck: &types.ConditionCheck{
+					TableName:           aws.String("tx_items"),
+					Key:                 map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#1"}},
+					ConditionExpression: aws.String("#v = :expected"),
+					ExpressionAttributeNames: map[string]string{
+						"#v": "version",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":expected": &types.AttributeValueMemberN{Value: "999"},
+					},
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName: aws.String("tx_items"),
+					Item: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "item#3"},
+					},
+				},
+			},
+		},
+	})
+	var tce *types.TransactionCanceledException
+	if !errors.As(err, &tce) {
+		t.Fatalf("expected transaction canceled, got: %v", err)
+	}
+
+	afterFailure, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String("tx_items"),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#1"}},
+	})
+	if err != nil {
+		t.Fatalf("get after failed transaction failed: %v", err)
+	}
+	if got := afterFailure.Item["status"].(*types.AttributeValueMemberS).Value; got != "committed" {
+		t.Fatalf("status after rollback got=%q want=%q", got, "committed")
+	}
+	if got := afterFailure.Item["version"].(*types.AttributeValueMemberN).Value; got != "2" {
+		t.Fatalf("version after rollback got=%q want=%q", got, "2")
+	}
+
+	missing, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String("tx_items"),
+		Key:       map[string]types.AttributeValue{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "item#3"}},
+	})
+	if err != nil {
+		t.Fatalf("get rollback-created item failed: %v", err)
+	}
+	if missing.Item != nil {
+		t.Fatalf("expected item#3 not to exist due to rollback, got: %#v", missing.Item)
+	}
+}
