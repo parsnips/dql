@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
@@ -18,47 +21,93 @@ type Server struct {
 	engine  storage.Engine
 }
 
+type checksumResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func newChecksumResponseWriter() *checksumResponseWriter {
+	return &checksumResponseWriter{header: make(http.Header)}
+}
+
+func (w *checksumResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *checksumResponseWriter) Write(p []byte) (int, error) {
+	return w.body.Write(p)
+}
+
+func (w *checksumResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *checksumResponseWriter) flushTo(dst http.ResponseWriter) {
+	for key, values := range w.header {
+		for _, value := range values {
+			dst.Header().Add(key, value)
+		}
+	}
+	dst.Header().Set("X-Amz-Crc32", strconv.FormatUint(uint64(crc32.ChecksumIEEE(w.body.Bytes())), 10))
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	dst.WriteHeader(w.status)
+	if w.body.Len() > 0 {
+		_, _ = dst.Write(w.body.Bytes())
+	}
+}
+
 func NewServer(catalog *table.Catalog, engine storage.Engine) *Server {
 	return &Server{catalog: catalog, engine: engine}
 }
 func (s *Server) Handler() http.Handler { return http.HandlerFunc(s.handle) }
 
 func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
+	rw := newChecksumResponseWriter()
+	defer rw.flushTo(w)
+
+	if r.Body != nil {
+		defer r.Body.Close()
+	}
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "ValidationException", "unsupported method")
+		writeError(rw, http.StatusMethodNotAllowed, "ValidationException", "unsupported method")
 		return
 	}
 	target := r.Header.Get("X-Amz-Target")
 	parts := strings.Split(target, ".")
 	if len(parts) != 2 || parts[0] != "DynamoDB_20120810" {
-		writeError(w, http.StatusBadRequest, "ValidationException", "Invalid X-Amz-Target")
+		writeError(rw, http.StatusBadRequest, "ValidationException", "Invalid X-Amz-Target")
 		return
 	}
 	payload, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "ValidationException", "unable to read request")
+		writeError(rw, http.StatusBadRequest, "ValidationException", "unable to read request")
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+	rw.Header().Set("Content-Type", "application/x-amz-json-1.0")
 	switch parts[1] {
 	case "CreateTable":
-		s.createTable(w, payload)
+		s.createTable(rw, payload)
 	case "DescribeTable":
-		s.describeTable(w, payload)
+		s.describeTable(rw, payload)
 	case "ListTables":
-		s.listTables(w, payload)
+		s.listTables(rw, payload)
 	case "DeleteTable":
-		s.deleteTable(w, payload)
+		s.deleteTable(rw, payload)
 	case "PutItem":
-		s.putItem(w, payload)
+		s.putItem(rw, payload)
 	case "GetItem":
-		s.getItem(w, payload)
+		s.getItem(rw, payload)
 	case "DeleteItem":
-		s.deleteItem(w, payload)
+		s.deleteItem(rw, payload)
 	case "UpdateItem":
-		s.updateItem(w, payload)
+		s.updateItem(rw, payload)
 	default:
-		writeError(w, http.StatusBadRequest, "ValidationException", fmt.Sprintf("Unknown operation %s", parts[1]))
+		writeError(rw, http.StatusBadRequest, "ValidationException", fmt.Sprintf("Unknown operation %s", parts[1]))
 	}
 }
 
