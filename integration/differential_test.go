@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -16,12 +17,22 @@ import (
 )
 
 type scenarioResult struct {
-	TableNames []string
-	GotItem    map[string]types.AttributeValue
-	Updated    map[string]types.AttributeValue
-	Deleted    map[string]types.AttributeValue
-	ExprUpdate map[string]types.AttributeValue
-	CondErr    string
+	TableNames            []string
+	UpdateTableSnapshot   tableSnapshot
+	EnabledTableSnapshot  tableSnapshot
+	DisabledTableSnapshot tableSnapshot
+	GotItem               map[string]types.AttributeValue
+	Updated               map[string]types.AttributeValue
+	Deleted               map[string]types.AttributeValue
+	ExprUpdate            map[string]types.AttributeValue
+	CondErr               string
+}
+
+type tableSnapshot struct {
+	StreamEnabled  bool
+	StreamViewType types.StreamViewType
+	GSINames       []string
+	GSIStatuses    map[string]types.IndexStatus
 }
 
 func TestDifferentialDynamoDBLocalAndDQLCoreCRUD(t *testing.T) {
@@ -35,6 +46,9 @@ func TestDifferentialDynamoDBLocalAndDQLCoreCRUD(t *testing.T) {
 	if got, want := dqlResult.TableNames, ddbResult.TableNames; len(got) != len(want) {
 		t.Fatalf("table list cardinality mismatch dql=%v dynamodb-local=%v", got, want)
 	}
+	assertTableSnapshotParity(t, dqlResult.UpdateTableSnapshot, ddbResult.UpdateTableSnapshot, "UpdateTable response")
+	assertTableSnapshotParity(t, dqlResult.EnabledTableSnapshot, ddbResult.EnabledTableSnapshot, "DescribeTable after stream/GSI enable")
+	assertTableSnapshotParity(t, dqlResult.DisabledTableSnapshot, ddbResult.DisabledTableSnapshot, "DescribeTable after stream disable")
 
 	assertAttributeMapEqual(t, dqlResult.GotItem, ddbResult.GotItem, "GetItem")
 	assertAttributeMapEqual(t, dqlResult.Updated, ddbResult.Updated, "UpdateItem ReturnValues")
@@ -72,6 +86,61 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 	if err != nil {
 		t.Fatalf("create table %q failed: %v", tableName, err)
 	}
+
+	updateOut, err := client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String(tableName),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		StreamSpecification: &types.StreamSpecification{
+			StreamEnabled:  aws.Bool(true),
+			StreamViewType: types.StreamViewTypeNewImage,
+		},
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{
+			{
+				Create: &types.CreateGlobalSecondaryIndexAction{
+					IndexName: aws.String("gsi1"),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("update table (enable stream/create gsi) for %q failed: %v", tableName, err)
+	}
+
+	enabledSnap := waitForTableSnapshot(
+		t, ctx, client, tableName,
+		func(s tableSnapshot) bool {
+			return s.StreamEnabled &&
+				s.StreamViewType == types.StreamViewTypeNewImage &&
+				containsString(s.GSINames, "gsi1")
+		},
+		"stream enabled + gsi present",
+	)
+
+	_, err = client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String(tableName),
+		StreamSpecification: &types.StreamSpecification{
+			StreamEnabled: aws.Bool(false),
+		},
+	})
+	if err != nil {
+		t.Fatalf("update table (disable stream) for %q failed: %v", tableName, err)
+	}
+
+	disabledSnap := waitForTableSnapshot(
+		t, ctx, client, tableName,
+		func(s tableSnapshot) bool {
+			return !s.StreamEnabled && containsString(s.GSINames, "gsi1")
+		},
+		"stream disabled + gsi retained",
+	)
 
 	listOut, err := client.ListTables(ctx, &dynamodb.ListTablesInput{Limit: aws.Int32(100)})
 	if err != nil {
@@ -200,12 +269,97 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 	}
 
 	return scenarioResult{
-		TableNames: listOut.TableNames,
-		GotItem:    getOut.Item,
-		Updated:    updOut.Attributes,
-		Deleted:    delOut.Attributes,
-		ExprUpdate: exprOut.Attributes,
-		CondErr:    condErr,
+		TableNames:            listOut.TableNames,
+		UpdateTableSnapshot:   tableSnapshotFromDescription(updateOut.TableDescription),
+		EnabledTableSnapshot:  enabledSnap,
+		DisabledTableSnapshot: disabledSnap,
+		GotItem:               getOut.Item,
+		Updated:               updOut.Attributes,
+		Deleted:               delOut.Attributes,
+		ExprUpdate:            exprOut.Attributes,
+		CondErr:               condErr,
+	}
+}
+
+func tableSnapshotFromDescription(desc *types.TableDescription) tableSnapshot {
+	snap := tableSnapshot{GSIStatuses: map[string]types.IndexStatus{}}
+	if desc == nil {
+		return snap
+	}
+	if desc.StreamSpecification != nil {
+		snap.StreamEnabled = aws.ToBool(desc.StreamSpecification.StreamEnabled)
+		snap.StreamViewType = desc.StreamSpecification.StreamViewType
+	}
+	for _, gsi := range desc.GlobalSecondaryIndexes {
+		name := aws.ToString(gsi.IndexName)
+		if name == "" {
+			continue
+		}
+		snap.GSINames = append(snap.GSINames, name)
+		snap.GSIStatuses[name] = gsi.IndexStatus
+	}
+	sort.Strings(snap.GSINames)
+	return snap
+}
+
+func waitForTableSnapshot(
+	t *testing.T,
+	ctx context.Context,
+	client *dynamodb.Client,
+	tableName string,
+	ready func(tableSnapshot) bool,
+	stateLabel string,
+) tableSnapshot {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	last := tableSnapshot{GSIStatuses: map[string]types.IndexStatus{}}
+	for {
+		descOut, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(tableName)})
+		if err == nil {
+			last = tableSnapshotFromDescription(descOut.Table)
+			if ready(last) {
+				return last
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s for %q; last snapshot=%#v", stateLabel, tableName, last)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertTableSnapshotParity(t *testing.T, got, want tableSnapshot, operation string) {
+	t.Helper()
+	if got.StreamEnabled != want.StreamEnabled {
+		t.Fatalf("%s stream enabled mismatch got=%v want=%v", operation, got.StreamEnabled, want.StreamEnabled)
+	}
+	if got.StreamEnabled && got.StreamViewType != want.StreamViewType {
+		t.Fatalf("%s stream view mismatch got=%v want=%v", operation, got.StreamViewType, want.StreamViewType)
+	}
+	if len(got.GSINames) != len(want.GSINames) {
+		t.Fatalf("%s gsi count mismatch got=%v want=%v", operation, got.GSINames, want.GSINames)
+	}
+	for i := range got.GSINames {
+		if got.GSINames[i] != want.GSINames[i] {
+			t.Fatalf("%s gsi name mismatch got=%v want=%v", operation, got.GSINames, want.GSINames)
+		}
+		name := got.GSINames[i]
+		if gotStatus := got.GSIStatuses[name]; gotStatus == "" {
+			t.Fatalf("%s missing gsi status in dql for index %q", operation, name)
+		}
+		if wantStatus := want.GSIStatuses[name]; wantStatus == "" {
+			t.Fatalf("%s missing gsi status in dynamodb-local for index %q", operation, name)
+		}
 	}
 }
 
