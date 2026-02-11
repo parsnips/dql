@@ -14,6 +14,8 @@ type Definition struct {
 	SortKey        string
 	AttributeTypes map[string]types.ScalarAttributeType
 	Status         types.TableStatus
+	StreamSpec     *types.StreamSpecification
+	GlobalIndexes  map[string]types.GlobalSecondaryIndexDescription
 }
 
 type Catalog struct {
@@ -32,8 +34,25 @@ func (c *Catalog) Create(def Definition) error {
 		return fmt.Errorf("ResourceInUseException: table already exists: %s", def.Name)
 	}
 	def.Status = types.TableStatusActive
+	if def.GlobalIndexes == nil {
+		def.GlobalIndexes = map[string]types.GlobalSecondaryIndexDescription{}
+	}
 	c.tables[def.Name] = def
 	return nil
+}
+
+func (c *Catalog) Update(name string, mut func(*Definition) error) (Definition, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	def, ok := c.tables[name]
+	if !ok {
+		return Definition{}, fmt.Errorf("ResourceNotFoundException: table not found: %s", name)
+	}
+	if err := mut(&def); err != nil {
+		return Definition{}, err
+	}
+	c.tables[name] = def
+	return def, nil
 }
 
 func (c *Catalog) Get(name string) (Definition, bool) {

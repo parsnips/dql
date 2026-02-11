@@ -86,12 +86,44 @@ func TestTableLifecycleAndCoreCRUD(t *testing.T) {
 			StreamEnabled:  aws.Bool(true),
 			StreamViewType: types.StreamViewTypeNewImage,
 		},
+		GlobalSecondaryIndexUpdates: []types.GlobalSecondaryIndexUpdate{
+			{
+				Create: &types.CreateGlobalSecondaryIndexAction{
+					IndexName: aws.String("gsi1"),
+					KeySchema: []types.KeySchemaElement{
+						{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+						{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+					},
+					Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+				},
+			},
+		},
 	})
 	if err != nil {
 		t.Fatalf("update table failed: %v", err)
 	}
 	if updateTableOut.TableDescription == nil || aws.ToString(updateTableOut.TableDescription.TableName) != "phase1_items" {
 		t.Fatalf("unexpected update table output: %#v", updateTableOut.TableDescription)
+	}
+	if updateTableOut.TableDescription.StreamSpecification == nil || !aws.ToBool(updateTableOut.TableDescription.StreamSpecification.StreamEnabled) {
+		t.Fatalf("expected stream to be enabled: %#v", updateTableOut.TableDescription.StreamSpecification)
+	}
+	if len(updateTableOut.TableDescription.GlobalSecondaryIndexes) != 1 {
+		t.Fatalf("expected one gsi in update response: %#v", updateTableOut.TableDescription.GlobalSecondaryIndexes)
+	}
+	if got := updateTableOut.TableDescription.GlobalSecondaryIndexes[0].IndexStatus; got != types.IndexStatusActive {
+		t.Fatalf("unexpected gsi status: %v", got)
+	}
+
+	descOut, err = client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String("phase1_items")})
+	if err != nil {
+		t.Fatalf("describe after update failed: %v", err)
+	}
+	if descOut.Table == nil || descOut.Table.StreamSpecification == nil || !aws.ToBool(descOut.Table.StreamSpecification.StreamEnabled) {
+		t.Fatalf("expected stream spec to persist: %#v", descOut.Table)
+	}
+	if len(descOut.Table.GlobalSecondaryIndexes) != 1 {
+		t.Fatalf("expected gsi to persist after update: %#v", descOut.Table.GlobalSecondaryIndexes)
 	}
 
 	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{

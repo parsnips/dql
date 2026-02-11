@@ -535,7 +535,7 @@ Pass criteria for each item:
 - [x] `DescribeTable`
 - [x] `ListTables` pagination basics
 - [x] `DeleteTable`
-- [ ] `UpdateTable` (stream toggle + basic GSI status transitions/stubs)
+- [x] `UpdateTable` (stream toggle + basic GSI status transitions/stubs)
 
 #### Core Item Operations
 
@@ -580,7 +580,7 @@ Pass criteria for each item:
 
 ### 6.6 Current Phase 0/1 Progress Snapshot
 
-- Completed: compatibility harness, operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`), and memory-backed `PutItem`/`GetItem`/`DeleteItem` paths validated by AWS SDK v2 integration tests.
+- Completed: compatibility harness, operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`/`UpdateTable` stream+GSI stubs), and memory-backed `PutItem`/`GetItem`/`DeleteItem` paths validated by AWS SDK v2 integration tests.
 - In progress: `UpdateItem` parity beyond legacy `AttributeUpdates` flow, conditional expressions, and query/scan coverage.
 
 ### 6.6.1 Deferred-but-Accepted Expression Gaps (Backlog)
