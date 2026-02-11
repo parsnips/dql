@@ -1012,7 +1012,7 @@ func updatedAttributes(oldItem, newItem map[string]types.AttributeValue) (update
 		if ov == nil && nv == nil {
 			continue
 		}
-		if ov != nil && nv != nil && attributeValueEqual(ov, nv) {
+		if ov != nil && nv != nil && attributeValueEquivalent(ov, nv) {
 			continue
 		}
 		if ov != nil {
@@ -1029,4 +1029,81 @@ func updatedAttributes(oldItem, newItem map[string]types.AttributeValue) (update
 		updatedNew = nil
 	}
 	return
+}
+
+func attributeValueEquivalent(a, b types.AttributeValue) bool {
+	switch av := a.(type) {
+	case *types.AttributeValueMemberS:
+		bv, ok := b.(*types.AttributeValueMemberS)
+		return ok && av.Value == bv.Value
+	case *types.AttributeValueMemberN:
+		bv, ok := b.(*types.AttributeValueMemberN)
+		if !ok {
+			return false
+		}
+		ar, ok := new(big.Rat).SetString(av.Value)
+		if !ok {
+			return false
+		}
+		br, ok := new(big.Rat).SetString(bv.Value)
+		return ok && ar.Cmp(br) == 0
+	case *types.AttributeValueMemberB:
+		bv, ok := b.(*types.AttributeValueMemberB)
+		return ok && bytes.Equal(av.Value, bv.Value)
+	case *types.AttributeValueMemberBOOL:
+		bv, ok := b.(*types.AttributeValueMemberBOOL)
+		return ok && av.Value == bv.Value
+	case *types.AttributeValueMemberSS:
+		bv, ok := b.(*types.AttributeValueMemberSS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		return sortedStringSliceEqual(av.Value, bv.Value)
+	case *types.AttributeValueMemberNS:
+		bv, ok := b.(*types.AttributeValueMemberNS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		return sortedStringSliceEqual(av.Value, bv.Value)
+	case *types.AttributeValueMemberBS:
+		bv, ok := b.(*types.AttributeValueMemberBS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		return sortedBinarySliceEqual(av.Value, bv.Value)
+	default:
+		return false
+	}
+}
+
+func sortedStringSliceEqual(left, right []string) bool {
+	l := append([]string{}, left...)
+	r := append([]string{}, right...)
+	sort.Strings(l)
+	sort.Strings(r)
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedBinarySliceEqual(left, right [][]byte) bool {
+	l := make([]string, len(left))
+	r := make([]string, len(right))
+	for i := range left {
+		l[i] = string(left[i])
+	}
+	for i := range right {
+		r[i] = string(right[i])
+	}
+	sort.Strings(l)
+	sort.Strings(r)
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
 }
