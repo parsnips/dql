@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"testing"
@@ -19,6 +20,8 @@ type scenarioResult struct {
 	GotItem    map[string]types.AttributeValue
 	Updated    map[string]types.AttributeValue
 	Deleted    map[string]types.AttributeValue
+	ExprUpdate map[string]types.AttributeValue
+	CondErr    string
 }
 
 func TestDifferentialDynamoDBLocalAndDQLCoreCRUD(t *testing.T) {
@@ -36,6 +39,10 @@ func TestDifferentialDynamoDBLocalAndDQLCoreCRUD(t *testing.T) {
 	assertAttributeMapEqual(t, dqlResult.GotItem, ddbResult.GotItem, "GetItem")
 	assertAttributeMapEqual(t, dqlResult.Updated, ddbResult.Updated, "UpdateItem ReturnValues")
 	assertAttributeMapEqual(t, dqlResult.Deleted, ddbResult.Deleted, "DeleteItem ReturnValues")
+	assertAttributeMapEqual(t, dqlResult.ExprUpdate, ddbResult.ExprUpdate, "UpdateItem UpdateExpression ReturnValues")
+	if dqlResult.CondErr != ddbResult.CondErr {
+		t.Fatalf("conditional error mismatch dql=%q dynamodb-local=%q", dqlResult.CondErr, ddbResult.CondErr)
+	}
 
 	dqlErr := unknownOperationResponse(t, dql.Endpoint, dql.HTTPClient)
 	ddbErr := unknownOperationResponse(t, ddbLocal.Endpoint, ddbLocal.HTTPClient)
@@ -126,6 +133,67 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 		t.Fatalf("delete item in %q failed: %v", tableName, err)
 	}
 
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(tableName),
+		Item: map[string]types.AttributeValue{
+			"pk":      &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk":      &types.AttributeValueMemberS{Value: "user#1"},
+			"counter": &types.AttributeValueMemberN{Value: "1"},
+			"tags":    &types.AttributeValueMemberSS{Value: []string{"a", "b", "c"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("seed expression item in %q failed: %v", tableName, err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String(tableName),
+		ConditionExpression: aws.String("attribute_not_exists(#pk)"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk": "pk",
+		},
+		Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk": &types.AttributeValueMemberS{Value: "user#1"},
+		},
+	})
+	condErr := ""
+	if err != nil {
+		var cfe *types.ConditionalCheckFailedException
+		if !errors.As(err, &cfe) {
+			t.Fatalf("expected conditional check failed in %q, got: %v", tableName, err)
+		}
+		condErr = cfe.ErrorCode()
+	} else {
+		t.Fatalf("expected conditional failure in %q", tableName)
+	}
+
+	exprOut, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk": &types.AttributeValueMemberS{Value: "user#1"},
+		},
+		ConditionExpression: aws.String("#counter = :current"),
+		UpdateExpression:    aws.String("SET #name = :name REMOVE #old ADD #counter :inc DELETE #tags :drop"),
+		ExpressionAttributeNames: map[string]string{
+			"#counter": "counter",
+			"#name":    "name",
+			"#old":     "old_attr",
+			"#tags":    "tags",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":current": &types.AttributeValueMemberN{Value: "1"},
+			":name":    &types.AttributeValueMemberS{Value: "alice"},
+			":inc":     &types.AttributeValueMemberN{Value: "2"},
+			":drop":    &types.AttributeValueMemberSS{Value: []string{"a", "x"}},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
+	if err != nil {
+		t.Fatalf("expression update in %q failed: %v", tableName, err)
+	}
+
 	_, err = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(tableName)})
 	if err != nil {
 		t.Fatalf("delete table %q failed: %v", tableName, err)
@@ -136,6 +204,8 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 		GotItem:    getOut.Item,
 		Updated:    updOut.Attributes,
 		Deleted:    delOut.Attributes,
+		ExprUpdate: exprOut.Attributes,
+		CondErr:    condErr,
 	}
 }
 
@@ -163,6 +233,24 @@ func attributeValueEqual(a, b types.AttributeValue) bool {
 	case *types.AttributeValueMemberN:
 		bv, ok := b.(*types.AttributeValueMemberN)
 		return ok && av.Value == bv.Value
+	case *types.AttributeValueMemberBOOL:
+		bv, ok := b.(*types.AttributeValueMemberBOOL)
+		return ok && av.Value == bv.Value
+	case *types.AttributeValueMemberSS:
+		bv, ok := b.(*types.AttributeValueMemberSS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		left := append([]string{}, av.Value...)
+		right := append([]string{}, bv.Value...)
+		sort.Strings(left)
+		sort.Strings(right)
+		for i := range left {
+			if left[i] != right[i] {
+				return false
+			}
+		}
+		return true
 	default:
 		return false
 	}
