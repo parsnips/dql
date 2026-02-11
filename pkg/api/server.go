@@ -108,6 +108,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.deleteItem(rw, payload)
 	case "UpdateItem":
 		s.updateItem(rw, payload)
+	case "BatchWriteItem":
+		s.batchWriteItem(rw, payload)
+	case "BatchGetItem":
+		s.batchGetItem(rw, payload)
 	case "Query":
 		s.query(rw, payload)
 	case "Scan":
@@ -568,6 +572,117 @@ func (s *Server) updateItem(w http.ResponseWriter, payload []byte) {
 		}
 	}
 	_, _ = w.Write([]byte("{}"))
+}
+
+func (s *Server) batchWriteItem(w http.ResponseWriter, payload []byte) {
+	var in struct {
+		RequestItems map[string][]json.RawMessage `json:"RequestItems"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	if len(in.RequestItems) == 0 {
+		writeError(w, 400, "ValidationException", "RequestItems is required")
+		return
+	}
+
+	for tableName, requests := range in.RequestItems {
+		for _, rawReq := range requests {
+			var req struct {
+				PutRequest *struct {
+					Item json.RawMessage `json:"Item"`
+				} `json:"PutRequest"`
+				DeleteRequest *struct {
+					Key json.RawMessage `json:"Key"`
+				} `json:"DeleteRequest"`
+			}
+			if err := json.Unmarshal(rawReq, &req); err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			switch {
+			case req.PutRequest != nil:
+				item, err := attributevalue.UnmarshalMapJSON(req.PutRequest.Item)
+				if err != nil {
+					writeError(w, 400, "ValidationException", err.Error())
+					return
+				}
+				if _, err := s.engine.PutItem(tableName, item); err != nil {
+					writeTyped(w, err)
+					return
+				}
+			case req.DeleteRequest != nil:
+				key, err := attributevalue.UnmarshalMapJSON(req.DeleteRequest.Key)
+				if err != nil {
+					writeError(w, 400, "ValidationException", err.Error())
+					return
+				}
+				if _, err := s.engine.DeleteItem(tableName, key); err != nil {
+					writeTyped(w, err)
+					return
+				}
+			default:
+				writeError(w, 400, "ValidationException", "Each write request must include PutRequest or DeleteRequest")
+				return
+			}
+		}
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]any{"UnprocessedItems": map[string][]json.RawMessage{}})
+}
+
+func (s *Server) batchGetItem(w http.ResponseWriter, payload []byte) {
+	var in struct {
+		RequestItems map[string]struct {
+			Keys                     []json.RawMessage `json:"Keys"`
+			ProjectionExpression     string            `json:"ProjectionExpression"`
+			ExpressionAttributeNames map[string]string `json:"ExpressionAttributeNames"`
+		} `json:"RequestItems"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	if len(in.RequestItems) == 0 {
+		writeError(w, 400, "ValidationException", "RequestItems is required")
+		return
+	}
+
+	responses := map[string][]json.RawMessage{}
+	for tableName, req := range in.RequestItems {
+		items := make([]map[string]types.AttributeValue, 0, len(req.Keys))
+		for _, rawKey := range req.Keys {
+			key, err := attributevalue.UnmarshalMapJSON(rawKey)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			item, err := s.engine.GetItem(tableName, key)
+			if err != nil {
+				writeTyped(w, err)
+				return
+			}
+			if item != nil {
+				items = append(items, item)
+			}
+		}
+		items = applyProjectionExpression(items, req.ProjectionExpression, req.ExpressionAttributeNames)
+		responses[tableName] = make([]json.RawMessage, 0, len(items))
+		for _, item := range items {
+			b, err := attributevalue.MarshalMapJSON(item)
+			if err != nil {
+				writeError(w, 500, "InternalServerError", err.Error())
+				return
+			}
+			responses[tableName] = append(responses[tableName], json.RawMessage(b))
+		}
+	}
+
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"Responses":       responses,
+		"UnprocessedKeys": map[string]any{},
+	})
 }
 
 func (s *Server) query(w http.ResponseWriter, payload []byte) {

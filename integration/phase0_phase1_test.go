@@ -487,6 +487,133 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 	}
 }
 
+func TestBatchWriteAndBatchGetRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	h := testutil.NewHarness(t)
+	client := h.Client
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("phase1_batch"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+
+	batchWriteOut, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"phase1_batch": {
+				{
+					PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{
+						"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":   &types.AttributeValueMemberS{Value: "item#1"},
+						"name": &types.AttributeValueMemberS{Value: "one"},
+					}},
+				},
+				{
+					PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{
+						"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":   &types.AttributeValueMemberS{Value: "item#2"},
+						"name": &types.AttributeValueMemberS{Value: "two"},
+					}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("batch write put failed: %v", err)
+	}
+	if got := len(batchWriteOut.UnprocessedItems); got != 0 {
+		t.Fatalf("expected no unprocessed items, got: %#v", batchWriteOut.UnprocessedItems)
+	}
+
+	batchGetOut, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			"phase1_batch": {
+				Keys: []map[string]types.AttributeValue{
+					{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "item#1"},
+					},
+					{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "item#2"},
+					},
+					{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "item#missing"},
+					},
+				},
+				ProjectionExpression: aws.String("#pk,#name"),
+				ExpressionAttributeNames: map[string]string{
+					"#pk":   "pk",
+					"#name": "name",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("batch get failed: %v", err)
+	}
+	if got := len(batchGetOut.UnprocessedKeys); got != 0 {
+		t.Fatalf("expected no unprocessed keys, got: %#v", batchGetOut.UnprocessedKeys)
+	}
+	items := batchGetOut.Responses["phase1_batch"]
+	if got, want := len(items), 2; got != want {
+		t.Fatalf("unexpected batch get size got=%d want=%d", got, want)
+	}
+	for _, item := range items {
+		if _, ok := item["pk"]; !ok {
+			t.Fatalf("expected pk in projected item: %#v", item)
+		}
+		if _, ok := item["name"]; !ok {
+			t.Fatalf("expected name in projected item: %#v", item)
+		}
+		if _, ok := item["sk"]; ok {
+			t.Fatalf("did not expect sk in projected item: %#v", item)
+		}
+	}
+
+	batchWriteOut, err = client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			"phase1_batch": {
+				{DeleteRequest: &types.DeleteRequest{Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+					"sk": &types.AttributeValueMemberS{Value: "item#1"},
+				}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("batch write delete failed: %v", err)
+	}
+	if got := len(batchWriteOut.UnprocessedItems); got != 0 {
+		t.Fatalf("expected no unprocessed items after delete, got: %#v", batchWriteOut.UnprocessedItems)
+	}
+
+	getOut, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String("phase1_batch"),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+			"sk": &types.AttributeValueMemberS{Value: "item#1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("get after batch delete failed: %v", err)
+	}
+	if len(getOut.Item) != 0 {
+		t.Fatalf("expected deleted item to be missing, got: %#v", getOut.Item)
+	}
+}
+
 func TestConditionExpressionAndUpdateExpression(t *testing.T) {
 	ctx := context.Background()
 	h := testutil.NewHarness(t)
