@@ -25,6 +25,11 @@ type scenarioResult struct {
 	Updated               map[string]types.AttributeValue
 	Deleted               map[string]types.AttributeValue
 	ExprUpdate            map[string]types.AttributeValue
+	ExprAdvancedUpdate    map[string]types.AttributeValue
+	ExprSetAddUpdate      map[string]types.AttributeValue
+	ExprSetDelUpdate      map[string]types.AttributeValue
+	UpdatedOldReturn      map[string]types.AttributeValue
+	UpdatedNewReturn      map[string]types.AttributeValue
 	CondErr               string
 }
 
@@ -54,6 +59,11 @@ func TestDifferentialDynamoDBLocalAndDQLCoreCRUD(t *testing.T) {
 	assertAttributeMapEqual(t, dqlResult.Updated, ddbResult.Updated, "UpdateItem ReturnValues")
 	assertAttributeMapEqual(t, dqlResult.Deleted, ddbResult.Deleted, "DeleteItem ReturnValues")
 	assertAttributeMapEqual(t, dqlResult.ExprUpdate, ddbResult.ExprUpdate, "UpdateItem UpdateExpression ReturnValues")
+	assertAttributeMapEqual(t, dqlResult.ExprAdvancedUpdate, ddbResult.ExprAdvancedUpdate, "UpdateItem advanced ConditionExpression parity")
+	assertAttributeMapEqual(t, dqlResult.ExprSetAddUpdate, ddbResult.ExprSetAddUpdate, "UpdateItem ADD NS/BS parity")
+	assertAttributeMapEqual(t, dqlResult.ExprSetDelUpdate, ddbResult.ExprSetDelUpdate, "UpdateItem DELETE NS/BS parity")
+	assertAttributeMapEqual(t, dqlResult.UpdatedOldReturn, ddbResult.UpdatedOldReturn, "UpdateItem ReturnValues=UPDATED_OLD")
+	assertAttributeMapEqual(t, dqlResult.UpdatedNewReturn, ddbResult.UpdatedNewReturn, "UpdateItem ReturnValues=UPDATED_NEW")
 	if dqlResult.CondErr != ddbResult.CondErr {
 		t.Fatalf("conditional error mismatch dql=%q dynamodb-local=%q", dqlResult.CondErr, ddbResult.CondErr)
 	}
@@ -209,6 +219,8 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 			"sk":      &types.AttributeValueMemberS{Value: "user#1"},
 			"counter": &types.AttributeValueMemberN{Value: "1"},
 			"tags":    &types.AttributeValueMemberSS{Value: []string{"a", "b", "c"}},
+			"scores":  &types.AttributeValueMemberNS{Value: []string{"1", "2"}},
+			"blobs":   &types.AttributeValueMemberBS{Value: [][]byte{[]byte("x"), []byte("y")}},
 		},
 	})
 	if err != nil {
@@ -263,6 +275,121 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 		t.Fatalf("expression update in %q failed: %v", tableName, err)
 	}
 
+	advancedExprOut, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk": &types.AttributeValueMemberS{Value: "user#1"},
+		},
+		ConditionExpression: aws.String("begins_with(#name, :prefix) AND contains(#tags, :tag) AND size(#tags) >= :min AND (NOT (#counter BETWEEN :one AND :two) OR #counter IN (:three, :ten))"),
+		UpdateExpression:    aws.String("SET #status = :active"),
+		ExpressionAttributeNames: map[string]string{
+			"#name":    "name",
+			"#tags":    "tags",
+			"#counter": "counter",
+			"#status":  "status",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":prefix": &types.AttributeValueMemberS{Value: "al"},
+			":tag":    &types.AttributeValueMemberS{Value: "b"},
+			":min":    &types.AttributeValueMemberN{Value: "2"},
+			":one":    &types.AttributeValueMemberN{Value: "1"},
+			":two":    &types.AttributeValueMemberN{Value: "2"},
+			":three":  &types.AttributeValueMemberN{Value: "3"},
+			":ten":    &types.AttributeValueMemberN{Value: "10"},
+			":active": &types.AttributeValueMemberS{Value: "active"},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
+	if err != nil {
+		t.Fatalf("advanced expression update in %q failed: %v", tableName, err)
+	}
+
+	setAddExprOut, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk": &types.AttributeValueMemberS{Value: "user#1"},
+		},
+		UpdateExpression: aws.String("ADD #scores :addScores, #blobs :addBlobs"),
+		ExpressionAttributeNames: map[string]string{
+			"#scores": "scores",
+			"#blobs":  "blobs",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":addScores": &types.AttributeValueMemberNS{Value: []string{"2", "3"}},
+			":addBlobs":  &types.AttributeValueMemberBS{Value: [][]byte{[]byte("y"), []byte("z")}},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
+	if err != nil {
+		t.Fatalf("set ADD expression update in %q failed: %v", tableName, err)
+	}
+
+	setDelExprOut, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk": &types.AttributeValueMemberS{Value: "user#1"},
+		},
+		UpdateExpression: aws.String("DELETE #scores :delScores, #blobs :delBlobs"),
+		ExpressionAttributeNames: map[string]string{
+			"#scores": "scores",
+			"#blobs":  "blobs",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":delScores": &types.AttributeValueMemberNS{Value: []string{"1"}},
+			":delBlobs":  &types.AttributeValueMemberBS{Value: [][]byte{[]byte("x")}},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
+	if err != nil {
+		t.Fatalf("set DELETE expression update in %q failed: %v", tableName, err)
+	}
+
+	updatedOldOut, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk": &types.AttributeValueMemberS{Value: "user#1"},
+		},
+		UpdateExpression: aws.String("SET #name = :nameV2 REMOVE #status ADD #counter :inc"),
+		ExpressionAttributeNames: map[string]string{
+			"#name":    "name",
+			"#status":  "status",
+			"#counter": "counter",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":nameV2": &types.AttributeValueMemberS{Value: "alice-v2"},
+			":inc":    &types.AttributeValueMemberN{Value: "1"},
+		},
+		ReturnValues: types.ReturnValueUpdatedOld,
+	})
+	if err != nil {
+		t.Fatalf("updated-old return update in %q failed: %v", tableName, err)
+	}
+
+	updatedNewOut, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#2"},
+			"sk": &types.AttributeValueMemberS{Value: "user#1"},
+		},
+		UpdateExpression: aws.String("SET #name = :nameV3 ADD #counter :inc"),
+		ExpressionAttributeNames: map[string]string{
+			"#name":    "name",
+			"#counter": "counter",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":nameV3": &types.AttributeValueMemberS{Value: "alice-v3"},
+			":inc":    &types.AttributeValueMemberN{Value: "1"},
+		},
+		ReturnValues: types.ReturnValueUpdatedNew,
+	})
+	if err != nil {
+		t.Fatalf("updated-new return update in %q failed: %v", tableName, err)
+	}
+
 	_, err = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(tableName)})
 	if err != nil {
 		t.Fatalf("delete table %q failed: %v", tableName, err)
@@ -277,6 +404,11 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 		Updated:               updOut.Attributes,
 		Deleted:               delOut.Attributes,
 		ExprUpdate:            exprOut.Attributes,
+		ExprAdvancedUpdate:    advancedExprOut.Attributes,
+		ExprSetAddUpdate:      setAddExprOut.Attributes,
+		ExprSetDelUpdate:      setDelExprOut.Attributes,
+		UpdatedOldReturn:      updatedOldOut.Attributes,
+		UpdatedNewReturn:      updatedNewOut.Attributes,
 		CondErr:               condErr,
 	}
 }
@@ -390,24 +522,62 @@ func attributeValueEqual(a, b types.AttributeValue) bool {
 	case *types.AttributeValueMemberBOOL:
 		bv, ok := b.(*types.AttributeValueMemberBOOL)
 		return ok && av.Value == bv.Value
+	case *types.AttributeValueMemberB:
+		bv, ok := b.(*types.AttributeValueMemberB)
+		return ok && bytes.Equal(av.Value, bv.Value)
 	case *types.AttributeValueMemberSS:
 		bv, ok := b.(*types.AttributeValueMemberSS)
 		if !ok || len(av.Value) != len(bv.Value) {
 			return false
 		}
-		left := append([]string{}, av.Value...)
-		right := append([]string{}, bv.Value...)
-		sort.Strings(left)
-		sort.Strings(right)
-		for i := range left {
-			if left[i] != right[i] {
-				return false
-			}
+		return sortedStringsEqual(av.Value, bv.Value)
+	case *types.AttributeValueMemberNS:
+		bv, ok := b.(*types.AttributeValueMemberNS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
 		}
-		return true
+		return sortedStringsEqual(av.Value, bv.Value)
+	case *types.AttributeValueMemberBS:
+		bv, ok := b.(*types.AttributeValueMemberBS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		return sortedBinaryEqual(av.Value, bv.Value)
 	default:
 		return false
 	}
+}
+
+func sortedStringsEqual(left, right []string) bool {
+	l := append([]string{}, left...)
+	r := append([]string{}, right...)
+	sort.Strings(l)
+	sort.Strings(r)
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedBinaryEqual(left, right [][]byte) bool {
+	l := make([]string, len(left))
+	r := make([]string, len(right))
+	for i := range left {
+		l[i] = string(left[i])
+	}
+	for i := range right {
+		r[i] = string(right[i])
+	}
+	sort.Strings(l)
+	sort.Strings(r)
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type rawError struct {

@@ -1,9 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
+	"sort"
+	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
@@ -42,91 +46,563 @@ func (c expressionContext) resolveValue(token string) (types.AttributeValue, err
 	return v, nil
 }
 
+type tokenType int
+
+const (
+	tokEOF tokenType = iota
+	tokIdent
+	tokNameRef
+	tokValueRef
+	tokLParen
+	tokRParen
+	tokComma
+	tokEqual
+	tokNotEqual
+	tokLT
+	tokLTE
+	tokGT
+	tokGTE
+)
+
+type token struct {
+	typ tokenType
+	lit string
+}
+
+func lexExpression(input string) ([]token, error) {
+	var out []token
+	for i := 0; i < len(input); {
+		r := rune(input[i])
+		if unicode.IsSpace(r) {
+			i++
+			continue
+		}
+		switch input[i] {
+		case '(':
+			out = append(out, token{typ: tokLParen, lit: "("})
+			i++
+		case ')':
+			out = append(out, token{typ: tokRParen, lit: ")"})
+			i++
+		case ',':
+			out = append(out, token{typ: tokComma, lit: ","})
+			i++
+		case '=':
+			out = append(out, token{typ: tokEqual, lit: "="})
+			i++
+		case '<':
+			if i+1 < len(input) && input[i+1] == '>' {
+				out = append(out, token{typ: tokNotEqual, lit: "<>"})
+				i += 2
+			} else if i+1 < len(input) && input[i+1] == '=' {
+				out = append(out, token{typ: tokLTE, lit: "<="})
+				i += 2
+			} else {
+				out = append(out, token{typ: tokLT, lit: "<"})
+				i++
+			}
+		case '>':
+			if i+1 < len(input) && input[i+1] == '=' {
+				out = append(out, token{typ: tokGTE, lit: ">="})
+				i += 2
+			} else {
+				out = append(out, token{typ: tokGT, lit: ">"})
+				i++
+			}
+		case '#':
+			j := i + 1
+			for j < len(input) && isNameChar(input[j]) {
+				j++
+			}
+			if j == i+1 {
+				return nil, fmt.Errorf("ValidationException: invalid name reference")
+			}
+			out = append(out, token{typ: tokNameRef, lit: input[i:j]})
+			i = j
+		case ':':
+			j := i + 1
+			for j < len(input) && isNameChar(input[j]) {
+				j++
+			}
+			if j == i+1 {
+				return nil, fmt.Errorf("ValidationException: invalid value reference")
+			}
+			out = append(out, token{typ: tokValueRef, lit: input[i:j]})
+			i = j
+		default:
+			if !isNameChar(input[i]) {
+				return nil, fmt.Errorf("ValidationException: invalid token %q", string(input[i]))
+			}
+			j := i
+			for j < len(input) && isNameChar(input[j]) {
+				j++
+			}
+			out = append(out, token{typ: tokIdent, lit: input[i:j]})
+			i = j
+		}
+	}
+	out = append(out, token{typ: tokEOF})
+	return out, nil
+}
+
+func isNameChar(b byte) bool {
+	return b == '_' || b == '-' || b == '.' || unicode.IsLetter(rune(b)) || unicode.IsDigit(rune(b))
+}
+
+type parser struct {
+	tokens []token
+	pos    int
+}
+
+func (p *parser) curr() token { return p.tokens[p.pos] }
+func (p *parser) next() {
+	if p.pos < len(p.tokens)-1 {
+		p.pos++
+	}
+}
+func (p *parser) match(tt tokenType) bool {
+	if p.curr().typ == tt {
+		p.next()
+		return true
+	}
+	return false
+}
+
+func (p *parser) matchKeyword(word string) bool {
+	if p.curr().typ == tokIdent && strings.EqualFold(p.curr().lit, word) {
+		p.next()
+		return true
+	}
+	return false
+}
+
+func (p *parser) expect(tt tokenType, msg string) error {
+	if !p.match(tt) {
+		return fmt.Errorf("ValidationException: %s", msg)
+	}
+	return nil
+}
+
+type boolExpr interface {
+	eval(map[string]types.AttributeValue, expressionContext) (bool, error)
+}
+type valueExpr interface {
+	eval(map[string]types.AttributeValue, expressionContext) (types.AttributeValue, error)
+}
+
+type logicalExpr struct {
+	op          string
+	left, right boolExpr
+}
+
+func (e logicalExpr) eval(item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
+	l, err := e.left.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	if e.op == "OR" && l {
+		return true, nil
+	}
+	if e.op == "AND" && !l {
+		return false, nil
+	}
+	r, err := e.right.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	if e.op == "AND" {
+		return l && r, nil
+	}
+	return l || r, nil
+}
+
+type notExpr struct{ inner boolExpr }
+
+func (e notExpr) eval(item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
+	v, err := e.inner.eval(item, ctx)
+	return !v, err
+}
+
+type attrPath struct{ name string }
+
+func (e attrPath) eval(item map[string]types.AttributeValue, ctx expressionContext) (types.AttributeValue, error) {
+	return item[ctx.resolveName(e.name)], nil
+}
+
+type valueRef struct{ ref string }
+
+func (e valueRef) eval(_ map[string]types.AttributeValue, ctx expressionContext) (types.AttributeValue, error) {
+	return ctx.resolveValue(e.ref)
+}
+
+type sizeExpr struct{ path attrPath }
+
+func (e sizeExpr) eval(item map[string]types.AttributeValue, ctx expressionContext) (types.AttributeValue, error) {
+	v, _ := e.path.eval(item, ctx)
+	if v == nil {
+		return nil, nil
+	}
+	sz, err := attributeValueSize(v)
+	if err != nil {
+		return nil, err
+	}
+	return &types.AttributeValueMemberN{Value: strconv.Itoa(sz)}, nil
+}
+
+type cmpExpr struct {
+	left  valueExpr
+	op    string
+	right valueExpr
+}
+
+func (e cmpExpr) eval(item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
+	l, err := e.left.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	r, err := e.right.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	if l == nil || r == nil {
+		return false, nil
+	}
+	if e.op == "<>" {
+		return !attributeValueEqual(l, r), nil
+	}
+	cmp, err := compareAttributeValues(l, r)
+	if err != nil {
+		return false, err
+	}
+	switch e.op {
+	case "=":
+		return cmp == 0, nil
+	case "<":
+		return cmp < 0, nil
+	case "<=":
+		return cmp <= 0, nil
+	case ">":
+		return cmp > 0, nil
+	case ">=":
+		return cmp >= 0, nil
+	}
+	return false, fmt.Errorf("ValidationException: unsupported ConditionExpression")
+}
+
+type betweenExpr struct{ target, lower, upper valueExpr }
+
+func (e betweenExpr) eval(item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
+	t, err := e.target.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	l, err := e.lower.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	u, err := e.upper.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	if t == nil || l == nil || u == nil {
+		return false, nil
+	}
+	c1, err := compareAttributeValues(t, l)
+	if err != nil {
+		return false, err
+	}
+	c2, err := compareAttributeValues(t, u)
+	if err != nil {
+		return false, err
+	}
+	return c1 >= 0 && c2 <= 0, nil
+}
+
+type inExpr struct {
+	target  valueExpr
+	choices []valueExpr
+}
+
+func (e inExpr) eval(item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
+	t, err := e.target.eval(item, ctx)
+	if err != nil {
+		return false, err
+	}
+	if t == nil {
+		return false, nil
+	}
+	for _, c := range e.choices {
+		v, err := c.eval(item, ctx)
+		if err != nil {
+			return false, err
+		}
+		if v != nil && attributeValueEqual(t, v) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+type fnExpr struct {
+	name string
+	args []valueExpr
+}
+
+func (e fnExpr) eval(item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
+	switch strings.ToLower(e.name) {
+	case "attribute_exists":
+		if len(e.args) != 1 {
+			return false, fmt.Errorf("ValidationException: invalid attribute_exists")
+		}
+		v, err := e.args[0].eval(item, ctx)
+		if err != nil {
+			return false, err
+		}
+		return v != nil, nil
+	case "attribute_not_exists":
+		if len(e.args) != 1 {
+			return false, fmt.Errorf("ValidationException: invalid attribute_not_exists")
+		}
+		v, err := e.args[0].eval(item, ctx)
+		if err != nil {
+			return false, err
+		}
+		return v == nil, nil
+	case "begins_with":
+		if len(e.args) != 2 {
+			return false, fmt.Errorf("ValidationException: invalid begins_with")
+		}
+		a, err := e.args[0].eval(item, ctx)
+		if err != nil {
+			return false, err
+		}
+		b, err := e.args[1].eval(item, ctx)
+		if err != nil {
+			return false, err
+		}
+		as, okA := a.(*types.AttributeValueMemberS)
+		bs, okB := b.(*types.AttributeValueMemberS)
+		if !okA || !okB || a == nil || b == nil {
+			return false, nil
+		}
+		return strings.HasPrefix(as.Value, bs.Value), nil
+	case "contains":
+		if len(e.args) != 2 {
+			return false, fmt.Errorf("ValidationException: invalid contains")
+		}
+		a, err := e.args[0].eval(item, ctx)
+		if err != nil {
+			return false, err
+		}
+		b, err := e.args[1].eval(item, ctx)
+		if err != nil {
+			return false, err
+		}
+		return containsAttributeValue(a, b)
+	default:
+		return false, fmt.Errorf("ValidationException: unsupported ConditionExpression")
+	}
+}
+
+func parseConditionExpression(expr string) (boolExpr, error) {
+	toks, err := lexExpression(expr)
+	if err != nil {
+		return nil, err
+	}
+	p := &parser{tokens: toks}
+	node, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+	if p.curr().typ != tokEOF {
+		return nil, fmt.Errorf("ValidationException: invalid ConditionExpression")
+	}
+	return node, nil
+}
+
+func (p *parser) parseOr() (boolExpr, error) {
+	left, err := p.parseAnd()
+	if err != nil {
+		return nil, err
+	}
+	for p.matchKeyword("OR") {
+		right, err := p.parseAnd()
+		if err != nil {
+			return nil, err
+		}
+		left = logicalExpr{op: "OR", left: left, right: right}
+	}
+	return left, nil
+}
+func (p *parser) parseAnd() (boolExpr, error) {
+	left, err := p.parseUnary()
+	if err != nil {
+		return nil, err
+	}
+	for p.matchKeyword("AND") {
+		right, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		left = logicalExpr{op: "AND", left: left, right: right}
+	}
+	return left, nil
+}
+func (p *parser) parseUnary() (boolExpr, error) {
+	if p.matchKeyword("NOT") {
+		in, err := p.parseUnary()
+		if err != nil {
+			return nil, err
+		}
+		return notExpr{inner: in}, nil
+	}
+	if p.match(tokLParen) {
+		in, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(tokRParen, "missing ')' in ConditionExpression"); err != nil {
+			return nil, err
+		}
+		return in, nil
+	}
+	return p.parsePredicate()
+}
+func (p *parser) parsePredicate() (boolExpr, error) {
+	if p.curr().typ == tokIdent && (strings.EqualFold(p.curr().lit, "attribute_exists") || strings.EqualFold(p.curr().lit, "attribute_not_exists") || strings.EqualFold(p.curr().lit, "begins_with") || strings.EqualFold(p.curr().lit, "contains")) {
+		name := p.curr().lit
+		p.next()
+		if err := p.expect(tokLParen, "invalid function expression"); err != nil {
+			return nil, err
+		}
+		args := []valueExpr{}
+		for {
+			arg, err := p.parseValueOperand()
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, arg)
+			if p.match(tokComma) {
+				continue
+			}
+			break
+		}
+		if err := p.expect(tokRParen, "missing ')' in function"); err != nil {
+			return nil, err
+		}
+		return fnExpr{name: name, args: args}, nil
+	}
+	left, err := p.parseValueOperand()
+	if err != nil {
+		return nil, err
+	}
+	if p.matchKeyword("BETWEEN") {
+		low, err := p.parseValueOperand()
+		if err != nil {
+			return nil, err
+		}
+		if !p.matchKeyword("AND") {
+			return nil, fmt.Errorf("ValidationException: invalid BETWEEN expression")
+		}
+		high, err := p.parseValueOperand()
+		if err != nil {
+			return nil, err
+		}
+		return betweenExpr{target: left, lower: low, upper: high}, nil
+	}
+	if p.matchKeyword("IN") {
+		if err := p.expect(tokLParen, "invalid IN expression"); err != nil {
+			return nil, err
+		}
+		choices := []valueExpr{}
+		for {
+			v, err := p.parseValueOperand()
+			if err != nil {
+				return nil, err
+			}
+			choices = append(choices, v)
+			if p.match(tokComma) {
+				continue
+			}
+			break
+		}
+		if err := p.expect(tokRParen, "invalid IN expression"); err != nil {
+			return nil, err
+		}
+		return inExpr{target: left, choices: choices}, nil
+	}
+	opTok := p.curr()
+	p.next()
+	op := ""
+	switch opTok.typ {
+	case tokEqual:
+		op = "="
+	case tokNotEqual:
+		op = "<>"
+	case tokLT:
+		op = "<"
+	case tokLTE:
+		op = "<="
+	case tokGT:
+		op = ">"
+	case tokGTE:
+		op = ">="
+	default:
+		return nil, fmt.Errorf("ValidationException: invalid ConditionExpression")
+	}
+	right, err := p.parseValueOperand()
+	if err != nil {
+		return nil, err
+	}
+	return cmpExpr{left: left, op: op, right: right}, nil
+}
+func (p *parser) parseValueOperand() (valueExpr, error) {
+	if p.curr().typ == tokIdent && strings.EqualFold(p.curr().lit, "size") {
+		p.next()
+		if err := p.expect(tokLParen, "invalid size expression"); err != nil {
+			return nil, err
+		}
+		path, err := p.parsePathOperand()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expect(tokRParen, "invalid size expression"); err != nil {
+			return nil, err
+		}
+		return sizeExpr{path: path}, nil
+	}
+	if p.curr().typ == tokValueRef {
+		lit := p.curr().lit
+		p.next()
+		return valueRef{ref: lit}, nil
+	}
+	path, err := p.parsePathOperand()
+	if err != nil {
+		return nil, err
+	}
+	return path, nil
+}
+func (p *parser) parsePathOperand() (attrPath, error) {
+	switch p.curr().typ {
+	case tokNameRef, tokIdent:
+		lit := p.curr().lit
+		p.next()
+		return attrPath{name: lit}, nil
+	default:
+		return attrPath{}, fmt.Errorf("ValidationException: invalid attribute path")
+	}
+}
+
 func evaluateConditionExpression(expr string, item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
 		return true, nil
 	}
-	for _, part := range splitByKeyword(expr, "AND") {
-		ok, err := evaluateConditionAtom(strings.TrimSpace(part), item, ctx)
-		if err != nil {
-			return false, err
-		}
-		if !ok {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
-func evaluateConditionAtom(atom string, item map[string]types.AttributeValue, ctx expressionContext) (bool, error) {
-	if strings.HasPrefix(atom, "attribute_exists(") && strings.HasSuffix(atom, ")") {
-		name := strings.TrimSuffix(strings.TrimPrefix(atom, "attribute_exists("), ")")
-		_, ok := item[ctx.resolveName(name)]
-		return ok, nil
-	}
-	if strings.HasPrefix(atom, "attribute_not_exists(") && strings.HasSuffix(atom, ")") {
-		name := strings.TrimSuffix(strings.TrimPrefix(atom, "attribute_not_exists("), ")")
-		_, ok := item[ctx.resolveName(name)]
-		return !ok, nil
-	}
-	nameToken, op, rhsToken, ok, err := parseConditionComparison(atom)
+	node, err := parseConditionExpression(expr)
 	if err != nil {
 		return false, err
 	}
-	if ok {
-		name := ctx.resolveName(nameToken)
-		rhs, err := ctx.resolveValue(rhsToken)
-		if err != nil {
-			return false, err
-		}
-		lhs := item[name]
-		if op == "<>" {
-			if lhs == nil {
-				return true, nil
-			}
-			return !attributeValueEqual(lhs, rhs), nil
-		}
-		if lhs == nil {
-			return false, nil
-		}
-		return attributeValueEqual(lhs, rhs), nil
-	}
-	return false, fmt.Errorf("ValidationException: unsupported ConditionExpression")
-}
-
-func parseConditionComparison(atom string) (string, string, string, bool, error) {
-	atom = strings.TrimSpace(atom)
-	if strings.Contains(atom, "<>") {
-		parts := strings.SplitN(atom, "<>", 2)
-		if len(parts) != 2 {
-			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
-		}
-		name := strings.TrimSpace(parts[0])
-		rhs := strings.TrimSpace(parts[1])
-		if name == "" || rhs == "" {
-			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
-		}
-		return name, "<>", rhs, true, nil
-	}
-	for _, unsupported := range []string{">=", "<=", ">", "<"} {
-		if strings.Contains(atom, unsupported) {
-			return "", "", "", false, fmt.Errorf("ValidationException: unsupported ConditionExpression")
-		}
-	}
-	if strings.Contains(atom, "=") {
-		parts := strings.SplitN(atom, "=", 2)
-		if len(parts) != 2 {
-			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
-		}
-		name := strings.TrimSpace(parts[0])
-		rhs := strings.TrimSpace(parts[1])
-		if name == "" || rhs == "" {
-			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
-		}
-		return name, "=", rhs, true, nil
-	}
-	return "", "", "", false, nil
+	return node.eval(item, ctx)
 }
 
 func applyUpdateExpression(item map[string]types.AttributeValue, expr string, ctx expressionContext) error {
@@ -134,159 +610,165 @@ func applyUpdateExpression(item map[string]types.AttributeValue, expr string, ct
 	if expr == "" {
 		return nil
 	}
-	remaining := expr
-	for len(strings.TrimSpace(remaining)) > 0 {
-		remaining = strings.TrimSpace(remaining)
+	toks, err := lexExpression(expr)
+	if err != nil {
+		return err
+	}
+	p := &parser{tokens: toks}
+	for p.curr().typ != tokEOF {
 		keyword := ""
 		switch {
-		case strings.HasPrefix(remaining, "SET "):
+		case p.matchKeyword("SET"):
 			keyword = "SET"
-			remaining = strings.TrimSpace(strings.TrimPrefix(remaining, "SET"))
-		case strings.HasPrefix(remaining, "REMOVE "):
+		case p.matchKeyword("REMOVE"):
 			keyword = "REMOVE"
-			remaining = strings.TrimSpace(strings.TrimPrefix(remaining, "REMOVE"))
-		case strings.HasPrefix(remaining, "ADD "):
+		case p.matchKeyword("ADD"):
 			keyword = "ADD"
-			remaining = strings.TrimSpace(strings.TrimPrefix(remaining, "ADD"))
-		case strings.HasPrefix(remaining, "DELETE "):
+		case p.matchKeyword("DELETE"):
 			keyword = "DELETE"
-			remaining = strings.TrimSpace(strings.TrimPrefix(remaining, "DELETE"))
 		default:
 			return fmt.Errorf("ValidationException: invalid UpdateExpression")
 		}
-		nextIdx := len(remaining)
-		for _, next := range []string{" SET ", " REMOVE ", " ADD ", " DELETE "} {
-			if idx := strings.Index(remaining, next); idx >= 0 && idx < nextIdx {
-				nextIdx = idx
-			}
-		}
-		clause := strings.TrimSpace(remaining[:nextIdx])
-		if err := applyUpdateClause(item, keyword, clause, ctx); err != nil {
+		if err := applyUpdateClauseTokens(item, keyword, p, ctx); err != nil {
 			return err
 		}
-		remaining = remaining[nextIdx:]
 	}
 	return nil
 }
 
-func applyUpdateClause(item map[string]types.AttributeValue, keyword, clause string, ctx expressionContext) error {
-	parts := splitCommaParts(clause)
-	for _, p := range parts {
+func applyUpdateClauseTokens(item map[string]types.AttributeValue, keyword string, p *parser, ctx expressionContext) error {
+	for {
 		switch keyword {
 		case "SET":
-			a := strings.SplitN(p, "=", 2)
-			if len(a) != 2 {
+			path, err := p.parsePathOperand()
+			if err != nil {
 				return fmt.Errorf("ValidationException: invalid SET expression")
 			}
-			name := ctx.resolveName(a[0])
-			v, err := ctx.resolveValue(a[1])
+			if err := p.expect(tokEqual, "invalid SET expression"); err != nil {
+				return err
+			}
+			if p.curr().typ != tokValueRef {
+				return fmt.Errorf("ValidationException: invalid SET expression")
+			}
+			v, err := ctx.resolveValue(p.curr().lit)
 			if err != nil {
 				return err
 			}
-			item[name] = v
+			p.next()
+			item[ctx.resolveName(path.name)] = v
 		case "REMOVE":
-			delete(item, ctx.resolveName(p))
+			path, err := p.parsePathOperand()
+			if err != nil {
+				return fmt.Errorf("ValidationException: invalid REMOVE expression")
+			}
+			delete(item, ctx.resolveName(path.name))
 		case "ADD":
-			a := strings.Fields(strings.TrimSpace(p))
-			if len(a) != 2 {
+			path, err := p.parsePathOperand()
+			if err != nil {
 				return fmt.Errorf("ValidationException: invalid ADD expression")
 			}
-			name := ctx.resolveName(a[0])
-			inc, err := ctx.resolveValue(a[1])
+			if p.curr().typ != tokValueRef {
+				return fmt.Errorf("ValidationException: invalid ADD expression")
+			}
+			v, err := ctx.resolveValue(p.curr().lit)
 			if err != nil {
 				return err
 			}
-			updated, err := addAttributeValue(item[name], inc)
+			p.next()
+			updated, err := addAttributeValue(item[ctx.resolveName(path.name)], v)
 			if err != nil {
 				return err
 			}
-			item[name] = updated
+			item[ctx.resolveName(path.name)] = updated
 		case "DELETE":
-			a := strings.Fields(strings.TrimSpace(p))
-			if len(a) != 2 {
+			path, err := p.parsePathOperand()
+			if err != nil {
 				return fmt.Errorf("ValidationException: invalid DELETE expression")
 			}
-			name := ctx.resolveName(a[0])
-			v, err := ctx.resolveValue(a[1])
+			if p.curr().typ != tokValueRef {
+				return fmt.Errorf("ValidationException: invalid DELETE expression")
+			}
+			v, err := ctx.resolveValue(p.curr().lit)
 			if err != nil {
 				return err
 			}
-			updated, err := deleteFromSet(item[name], v)
+			p.next()
+			updated, err := deleteFromSet(item[ctx.resolveName(path.name)], v)
 			if err != nil {
 				return err
 			}
 			if updated == nil {
-				delete(item, name)
+				delete(item, ctx.resolveName(path.name))
 			} else {
-				item[name] = updated
+				item[ctx.resolveName(path.name)] = updated
 			}
+		}
+		if !p.match(tokComma) {
+			break
 		}
 	}
 	return nil
 }
 
-func splitByKeyword(expr, keyword string) []string {
-	return strings.Split(expr, " "+keyword+" ")
-}
-
-func splitCommaParts(clause string) []string {
-	raw := strings.Split(clause, ",")
-	out := make([]string, 0, len(raw))
-	for _, part := range raw {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
-
 func attributeValueEqual(a, b types.AttributeValue) bool {
+	cmp, err := compareAttributeValues(a, b)
+	return err == nil && cmp == 0
+}
+
+func compareAttributeValues(a, b types.AttributeValue) (int, error) {
 	switch av := a.(type) {
 	case *types.AttributeValueMemberS:
 		bv, ok := b.(*types.AttributeValueMemberS)
-		return ok && av.Value == bv.Value
+		if !ok {
+			return 0, fmt.Errorf("ValidationException: incompatible attribute types")
+		}
+		return strings.Compare(av.Value, bv.Value), nil
 	case *types.AttributeValueMemberN:
 		bv, ok := b.(*types.AttributeValueMemberN)
 		if !ok {
-			return false
+			return 0, fmt.Errorf("ValidationException: incompatible attribute types")
 		}
 		ar, ok := new(big.Rat).SetString(av.Value)
 		if !ok {
-			return false
+			return 0, fmt.Errorf("ValidationException: invalid numeric value")
 		}
 		br, ok := new(big.Rat).SetString(bv.Value)
-		return ok && ar.Cmp(br) == 0
-	case *types.AttributeValueMemberBOOL:
-		bv, ok := b.(*types.AttributeValueMemberBOOL)
-		return ok && av.Value == bv.Value
+		if !ok {
+			return 0, fmt.Errorf("ValidationException: invalid numeric value")
+		}
+		return ar.Cmp(br), nil
+	case *types.AttributeValueMemberB:
+		bv, ok := b.(*types.AttributeValueMemberB)
+		if !ok {
+			return 0, fmt.Errorf("ValidationException: incompatible attribute types")
+		}
+		return bytes.Compare(av.Value, bv.Value), nil
 	default:
-		return false
+		return 0, fmt.Errorf("ValidationException: unsupported attribute type")
 	}
 }
 
 func addAttributeValue(current, add types.AttributeValue) (types.AttributeValue, error) {
-	inc, ok := add.(*types.AttributeValueMemberN)
-	if !ok {
-		return nil, fmt.Errorf("ValidationException: ADD currently supports Number values")
+	if addN, ok := add.(*types.AttributeValueMemberN); ok {
+		incRat, ok := new(big.Rat).SetString(addN.Value)
+		if !ok {
+			return nil, fmt.Errorf("ValidationException: invalid numeric value %q", addN.Value)
+		}
+		if current == nil {
+			return &types.AttributeValueMemberN{Value: addN.Value}, nil
+		}
+		currNum, ok := current.(*types.AttributeValueMemberN)
+		if !ok {
+			return nil, fmt.Errorf("ValidationException: ADD requires existing Number attribute")
+		}
+		currRat, ok := new(big.Rat).SetString(currNum.Value)
+		if !ok {
+			return nil, fmt.Errorf("ValidationException: invalid numeric value %q", currNum.Value)
+		}
+		currRat.Add(currRat, incRat)
+		return &types.AttributeValueMemberN{Value: ratToDynamoNumber(currRat)}, nil
 	}
-	incRat, ok := new(big.Rat).SetString(inc.Value)
-	if !ok {
-		return nil, fmt.Errorf("ValidationException: invalid numeric value %q", inc.Value)
-	}
-	if current == nil {
-		return &types.AttributeValueMemberN{Value: inc.Value}, nil
-	}
-	currNum, ok := current.(*types.AttributeValueMemberN)
-	if !ok {
-		return nil, fmt.Errorf("ValidationException: ADD requires existing Number attribute")
-	}
-	currRat, ok := new(big.Rat).SetString(currNum.Value)
-	if !ok {
-		return nil, fmt.Errorf("ValidationException: invalid numeric value %q", currNum.Value)
-	}
-	currRat.Add(currRat, incRat)
-	return &types.AttributeValueMemberN{Value: ratToDynamoNumber(currRat)}, nil
+	return unionSet(current, add)
 }
 
 func ratToDynamoNumber(r *big.Rat) string {
@@ -303,26 +785,325 @@ func ratToDynamoNumber(r *big.Rat) string {
 }
 
 func deleteFromSet(current, remove types.AttributeValue) (types.AttributeValue, error) {
-	currentSS, okCurrent := current.(*types.AttributeValueMemberSS)
-	removeSS, okRemove := remove.(*types.AttributeValueMemberSS)
-	if okCurrent && okRemove {
-		remaining := make([]string, 0, len(currentSS.Value))
-		toDelete := make(map[string]struct{}, len(removeSS.Value))
-		for _, v := range removeSS.Value {
-			toDelete[v] = struct{}{}
-		}
-		for _, v := range currentSS.Value {
-			if _, ok := toDelete[v]; !ok {
-				remaining = append(remaining, v)
-			}
-		}
-		if len(remaining) == 0 {
-			return nil, nil
-		}
-		return &types.AttributeValueMemberSS{Value: remaining}, nil
-	}
 	if current == nil {
 		return nil, nil
 	}
-	return nil, fmt.Errorf("ValidationException: DELETE currently supports String Set values")
+	switch c := current.(type) {
+	case *types.AttributeValueMemberSS:
+		r, ok := remove.(*types.AttributeValueMemberSS)
+		if !ok {
+			return nil, fmt.Errorf("ValidationException: DELETE set type mismatch")
+		}
+		return subtractStringSet(c.Value, r.Value), nil
+	case *types.AttributeValueMemberNS:
+		r, ok := remove.(*types.AttributeValueMemberNS)
+		if !ok {
+			return nil, fmt.Errorf("ValidationException: DELETE set type mismatch")
+		}
+		return subtractStringSetAsNS(c.Value, r.Value), nil
+	case *types.AttributeValueMemberBS:
+		r, ok := remove.(*types.AttributeValueMemberBS)
+		if !ok {
+			return nil, fmt.Errorf("ValidationException: DELETE set type mismatch")
+		}
+		return subtractBinarySet(c.Value, r.Value), nil
+	default:
+		return nil, fmt.Errorf("ValidationException: DELETE currently supports Set values")
+	}
+}
+
+func unionSet(current, add types.AttributeValue) (types.AttributeValue, error) {
+	switch a := add.(type) {
+	case *types.AttributeValueMemberSS:
+		cur := []string{}
+		if current != nil {
+			s, ok := current.(*types.AttributeValueMemberSS)
+			if !ok {
+				return nil, fmt.Errorf("ValidationException: ADD set type mismatch")
+			}
+			cur = s.Value
+		}
+		return &types.AttributeValueMemberSS{Value: uniqueStrings(append(append([]string{}, cur...), a.Value...))}, nil
+	case *types.AttributeValueMemberNS:
+		cur := []string{}
+		if current != nil {
+			s, ok := current.(*types.AttributeValueMemberNS)
+			if !ok {
+				return nil, fmt.Errorf("ValidationException: ADD set type mismatch")
+			}
+			cur = s.Value
+		}
+		return &types.AttributeValueMemberNS{Value: uniqueStrings(append(append([]string{}, cur...), a.Value...))}, nil
+	case *types.AttributeValueMemberBS:
+		var cur [][]byte
+		if current != nil {
+			s, ok := current.(*types.AttributeValueMemberBS)
+			if !ok {
+				return nil, fmt.Errorf("ValidationException: ADD set type mismatch")
+			}
+			cur = s.Value
+		}
+		return &types.AttributeValueMemberBS{Value: uniqueBinary(append(append([][]byte{}, cur...), a.Value...))}, nil
+	default:
+		return nil, fmt.Errorf("ValidationException: ADD currently supports Number or Set values")
+	}
+}
+
+func subtractStringSet(current, remove []string) types.AttributeValue {
+	rm := map[string]struct{}{}
+	for _, v := range remove {
+		rm[v] = struct{}{}
+	}
+	out := make([]string, 0, len(current))
+	for _, v := range current {
+		if _, ok := rm[v]; !ok {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return &types.AttributeValueMemberSS{Value: out}
+}
+func subtractStringSetAsNS(current, remove []string) types.AttributeValue {
+	rm := map[string]struct{}{}
+	for _, v := range remove {
+		rm[v] = struct{}{}
+	}
+	out := make([]string, 0, len(current))
+	for _, v := range current {
+		if _, ok := rm[v]; !ok {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return &types.AttributeValueMemberNS{Value: out}
+}
+func subtractBinarySet(current, remove [][]byte) types.AttributeValue {
+	rm := map[string]struct{}{}
+	for _, v := range remove {
+		rm[string(v)] = struct{}{}
+	}
+	out := make([][]byte, 0, len(current))
+	for _, v := range current {
+		if _, ok := rm[string(v)]; !ok {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return &types.AttributeValueMemberBS{Value: out}
+}
+func uniqueStrings(in []string) []string {
+	m := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if _, ok := m[v]; !ok {
+			m[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+func uniqueBinary(in [][]byte) [][]byte {
+	m := map[string][]byte{}
+	for _, v := range in {
+		m[string(v)] = v
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([][]byte, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, m[k])
+	}
+	return out
+}
+
+func attributeValueSize(v types.AttributeValue) (int, error) {
+	switch t := v.(type) {
+	case *types.AttributeValueMemberS:
+		return len(t.Value), nil
+	case *types.AttributeValueMemberB:
+		return len(t.Value), nil
+	case *types.AttributeValueMemberSS:
+		return len(t.Value), nil
+	case *types.AttributeValueMemberNS:
+		return len(t.Value), nil
+	case *types.AttributeValueMemberBS:
+		return len(t.Value), nil
+	case *types.AttributeValueMemberL:
+		return len(t.Value), nil
+	case *types.AttributeValueMemberM:
+		return len(t.Value), nil
+	default:
+		return 0, fmt.Errorf("ValidationException: size() unsupported for attribute type")
+	}
+}
+
+func containsAttributeValue(container, needle types.AttributeValue) (bool, error) {
+	if container == nil || needle == nil {
+		return false, nil
+	}
+	switch c := container.(type) {
+	case *types.AttributeValueMemberS:
+		n, ok := needle.(*types.AttributeValueMemberS)
+		if !ok {
+			return false, nil
+		}
+		return strings.Contains(c.Value, n.Value), nil
+	case *types.AttributeValueMemberSS:
+		n, ok := needle.(*types.AttributeValueMemberS)
+		if !ok {
+			return false, nil
+		}
+		for _, v := range c.Value {
+			if v == n.Value {
+				return true, nil
+			}
+		}
+		return false, nil
+	case *types.AttributeValueMemberNS:
+		n, ok := needle.(*types.AttributeValueMemberN)
+		if !ok {
+			return false, nil
+		}
+		for _, v := range c.Value {
+			if v == n.Value {
+				return true, nil
+			}
+		}
+		return false, nil
+	case *types.AttributeValueMemberBS:
+		n, ok := needle.(*types.AttributeValueMemberB)
+		if !ok {
+			return false, nil
+		}
+		for _, v := range c.Value {
+			if bytes.Equal(v, n.Value) {
+				return true, nil
+			}
+		}
+		return false, nil
+	default:
+		return false, nil
+	}
+}
+
+func updatedAttributes(oldItem, newItem map[string]types.AttributeValue) (updatedOld, updatedNew map[string]types.AttributeValue) {
+	updatedOld = map[string]types.AttributeValue{}
+	updatedNew = map[string]types.AttributeValue{}
+	seen := map[string]struct{}{}
+	for k := range oldItem {
+		seen[k] = struct{}{}
+	}
+	for k := range newItem {
+		seen[k] = struct{}{}
+	}
+	for k := range seen {
+		ov := oldItem[k]
+		nv := newItem[k]
+		if ov == nil && nv == nil {
+			continue
+		}
+		if ov != nil && nv != nil && attributeValueEquivalent(ov, nv) {
+			continue
+		}
+		if ov != nil {
+			updatedOld[k] = ov
+		}
+		if nv != nil {
+			updatedNew[k] = nv
+		}
+	}
+	if len(updatedOld) == 0 {
+		updatedOld = nil
+	}
+	if len(updatedNew) == 0 {
+		updatedNew = nil
+	}
+	return
+}
+
+func attributeValueEquivalent(a, b types.AttributeValue) bool {
+	switch av := a.(type) {
+	case *types.AttributeValueMemberS:
+		bv, ok := b.(*types.AttributeValueMemberS)
+		return ok && av.Value == bv.Value
+	case *types.AttributeValueMemberN:
+		bv, ok := b.(*types.AttributeValueMemberN)
+		if !ok {
+			return false
+		}
+		ar, ok := new(big.Rat).SetString(av.Value)
+		if !ok {
+			return false
+		}
+		br, ok := new(big.Rat).SetString(bv.Value)
+		return ok && ar.Cmp(br) == 0
+	case *types.AttributeValueMemberB:
+		bv, ok := b.(*types.AttributeValueMemberB)
+		return ok && bytes.Equal(av.Value, bv.Value)
+	case *types.AttributeValueMemberBOOL:
+		bv, ok := b.(*types.AttributeValueMemberBOOL)
+		return ok && av.Value == bv.Value
+	case *types.AttributeValueMemberSS:
+		bv, ok := b.(*types.AttributeValueMemberSS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		return sortedStringSliceEqual(av.Value, bv.Value)
+	case *types.AttributeValueMemberNS:
+		bv, ok := b.(*types.AttributeValueMemberNS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		return sortedStringSliceEqual(av.Value, bv.Value)
+	case *types.AttributeValueMemberBS:
+		bv, ok := b.(*types.AttributeValueMemberBS)
+		if !ok || len(av.Value) != len(bv.Value) {
+			return false
+		}
+		return sortedBinarySliceEqual(av.Value, bv.Value)
+	default:
+		return false
+	}
+}
+
+func sortedStringSliceEqual(left, right []string) bool {
+	l := append([]string{}, left...)
+	r := append([]string{}, right...)
+	sort.Strings(l)
+	sort.Strings(r)
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedBinarySliceEqual(left, right [][]byte) bool {
+	l := make([]string, len(left))
+	r := make([]string, len(right))
+	for i := range left {
+		l[i] = string(left[i])
+	}
+	for i := range right {
+		r[i] = string(right[i])
+	}
+	sort.Strings(l)
+	sort.Strings(r)
+	for i := range l {
+		if l[i] != r[i] {
+			return false
+		}
+	}
+	return true
 }

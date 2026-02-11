@@ -561,8 +561,8 @@ Pass criteria for each item:
 - [x] `ExpressionAttributeNames` substitution correctness (Query + Condition + Update paths)
 - [x] `ExpressionAttributeValues` substitution correctness (Query + Condition + Update paths)
 - [x] Functions: `attribute_exists`, `attribute_not_exists`
-- [ ] Functions: `begins_with`, `contains`, `size` (Condition/Filter expression parity)
-- [ ] Logical composition: `AND`/`OR`/`NOT` with expected precedence
+- [x] Functions: `begins_with`, `contains`, `size` (Condition expression parity)
+- [x] Logical composition: `AND`/`OR`/`NOT` with expected precedence
 
 #### Batch and Transactions
 
@@ -591,12 +591,12 @@ These are known parity gaps that are acceptable during current Phase 0/1 progres
 
 Target closure: Expression engine phase (`§4.7`, milestone table Phase `3`) unless explicitly re-prioritized.
 
-- [ ] `UpdateExpression` `ADD` set parity: support `SS`/`NS`/`BS` in addition to Number math (`#7`).
-- [ ] `UpdateExpression` `DELETE` set parity: support `NS`/`BS` in addition to `SS` (`#8`).
-- [ ] `ConditionExpression` grammar parity: `OR`/`NOT`, `BETWEEN`, `IN`, `begins_with`, `contains`, `size` (`#9`).
-- [ ] `UpdateItem` `ReturnValues` parity: implement `UPDATED_OLD` and `UPDATED_NEW` (`#10`).
-- [ ] Replace string-splitting expression parsing with lexer/parser + AST-based evaluation (`#11`).
-- [ ] Add focused unit tests for expression parsing/evaluation/update behavior (including malformed expressions and missing-item cases) (`#12`).
+- [x] `UpdateExpression` `ADD` set parity: support `SS`/`NS`/`BS` in addition to Number math (`#7`).
+- [x] `UpdateExpression` `DELETE` set parity: support `NS`/`BS` in addition to `SS` (`#8`).
+- [x] `ConditionExpression` grammar parity: `OR`/`NOT`, `BETWEEN`, `IN`, `begins_with`, `contains`, `size` (`#9`).
+- [x] `UpdateItem` `ReturnValues` parity: implement `UPDATED_OLD` and `UPDATED_NEW` (`#10`).
+- [x] Replace string-splitting expression parsing with lexer/parser + AST-based evaluation (`#11`).
+- [x] Add focused unit tests for expression parsing/evaluation/update behavior (including malformed expressions and missing-item cases) (`#12`).
 
 ### 6.7 Differential Harness Runtime (DynamoDB Local via Testcontainers)
 
