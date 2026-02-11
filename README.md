@@ -548,18 +548,20 @@ Pass criteria for each item:
 
 #### Query and Scan
 
-- [ ] `Query` with partition key equality
-- [ ] `Query` with sort key operators (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`)
-- [ ] `Query` `Limit` + `LastEvaluatedKey` + `ExclusiveStartKey`
-- [ ] `Scan` full table + filtered scan
+- [x] `Query` with partition key equality
+- [ ] `Query` with full sort key operator parity (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`)
+- [x] `Query` `Limit` + `LastEvaluatedKey` + `ExclusiveStartKey`
+- [x] `Scan` full table
+- [ ] `Scan` filtered scan (`FilterExpression`)
 - [ ] `ProjectionExpression` + `ExpressionAttributeNames`
-- [ ] `Select=COUNT`
+- [x] `Select=COUNT` (Scan path covered; Query path implemented but needs explicit parity coverage)
 
 #### Expression Semantics
 
-- [ ] `ExpressionAttributeNames` substitution correctness
-- [ ] `ExpressionAttributeValues` substitution correctness
-- [ ] Functions: `attribute_exists`, `attribute_not_exists`, `begins_with`, `contains`, `size`
+- [x] `ExpressionAttributeNames` substitution correctness (Query + Condition + Update paths)
+- [x] `ExpressionAttributeValues` substitution correctness (Query + Condition + Update paths)
+- [x] Functions: `attribute_exists`, `attribute_not_exists`
+- [ ] Functions: `begins_with`, `contains`, `size` (Condition/Filter expression parity)
 - [ ] Logical composition: `AND`/`OR`/`NOT` with expected precedence
 
 #### Batch and Transactions
@@ -580,8 +582,8 @@ Pass criteria for each item:
 
 ### 6.6 Current Phase 0/1 Progress Snapshot
 
-- Completed: compatibility harness, operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`/`UpdateTable` stream+GSI stubs), and memory-backed `PutItem`/`GetItem`/`DeleteItem` paths validated by AWS SDK v2 integration tests.
-- In progress: `UpdateItem` parity beyond legacy `AttributeUpdates` flow, conditional expressions, and query/scan coverage.
+- Completed: compatibility harness (dql vs DynamoDB Local), operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`), memory-backed CRUD, query/scan pagination + count basics, and conditional/update expression support (`ConditionExpression`, `UpdateExpression` with `SET`/`REMOVE`/`ADD` number/`DELETE` string set).
+- In progress: `UpdateTable` stream/GSI stub parity, filtered/projection query/scan semantics, and remaining expression grammar/function parity.
 
 ### 6.6.1 Deferred-but-Accepted Expression Gaps (Backlog)
 
