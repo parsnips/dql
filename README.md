@@ -582,8 +582,8 @@ Pass criteria for each item:
 
 - [ ] `BatchWriteItem` put/delete mix across tables
 - [ ] `BatchGetItem` key batches across tables
-- [ ] `TransactWriteItems` atomic success path
-- [ ] `TransactWriteItems` rollback on condition failure
+- [x] `TransactWriteItems` atomic success path
+- [x] `TransactWriteItems` rollback on condition failure
 - [ ] `TransactGetItems` consistent multi-item read behavior
 
 #### Streams, PartiQL, and Advanced
@@ -597,7 +597,7 @@ Pass criteria for each item:
 ### 6.6 Current Phase 0/1 Progress Snapshot
 
 - Completed: Phase 0 compatibility harness (dql vs DynamoDB Local), operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`/baseline `UpdateTable` stubs), memory-backed CRUD, query/scan pagination + count basics, and conditional/update expression support (`ConditionExpression`, `UpdateExpression` with `SET`/`REMOVE`/`ADD` number+set/`DELETE` set).
-- In progress: remaining Phase 1 compatibility gaps outside query/scan parity checklist (batch/transaction/streams/partiql/ttl).
+- In progress: remaining Phase 1 compatibility gaps outside query/scan parity checklist (batch, `TransactGetItems`, streams/partiql/ttl).
 
 ### 6.6.1 Deferred-but-Accepted Expression Gaps (Backlog)
 
