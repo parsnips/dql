@@ -115,7 +115,7 @@ The whole point is to eliminate the global lock. Here's the strategy:
 
 To de-risk compatibility and move faster, build in this order:
 
-1. **Compatibility harness first** (AWS SDK v2 client + golden tests against real DynamoDB and `dql`)
+1. **Compatibility harness first** (AWS SDK v2 client + golden tests against DynamoDB Local and `dql`)
 2. **API skeleton + in-memory backend** for fast iteration and deterministic tests
 3. **SQLite backend** for persistence and concurrency behavior
 4. **Expression support** (condition/filter/projection/update)
@@ -483,7 +483,8 @@ Decision rule: prefer mature libraries for syntax/model handling; keep DynamoDB 
 Every API capability lands with:
 
 - AWS SDK v2 integration coverage against `dql`
-- Differential checks against real DynamoDB for response shape/error parity (for covered cases)
+- Differential checks against DynamoDB Local for response shape/error parity (accepted Phase 0 baseline)
+- Optional targeted spot checks against real AWS DynamoDB only for ambiguous edge cases
 - Unit tests for parser/planner/storage edge conditions
 
 ### 6.1 Conformance Tests
@@ -584,7 +585,7 @@ Pass criteria for each item:
 
 ### 6.7 Differential Harness Runtime (DynamoDB Local via Testcontainers)
 
-Phase 0 differential tests can run without an AWS account by spinning up the official local image:
+Phase 0 differential baseline uses DynamoDB Local (no AWS account required):
 
 - Container image: `amazon/dynamodb-local:latest`
 - Orchestration: `github.com/testcontainers/testcontainers-go`
@@ -599,6 +600,8 @@ Environment requirements for CI/dev machines:
 - Current user allowed to access Docker daemon
 
 If Docker is unavailable, the differential test should be marked as skipped with an explicit setup message; the remaining non-differential integration tests should still run.
+
+Real AWS DynamoDB comparisons are optional and are not required for Phase 0 completion.
 
 ---
 
@@ -734,7 +737,7 @@ The **programmatic API** is critical — teams should be able to spin up a serve
 
 | Phase | Scope | Duration | Deliverable |
 |---|---|---|---|
-| **0** | Compatibility harness + differential tests | 2-3 days | AWS SDK v2 tests can run against real DynamoDB and `dql` |
+| **0** | Compatibility harness + differential tests | 2-3 days | AWS SDK v2 tests can run against DynamoDB Local and `dql` |
 | **1** | HTTP dispatch + table lifecycle + memory backend CRUD | 1-2 weeks | Core operations pass checklist on in-memory backend |
 | **2** | SQLite backend + pagination + index basics | 1-2 weeks | Durable backend passes same CRUD/query checklist |
 | **3** | Expression engine | 1-2 weeks | Condition/filter/projection/update expressions pass compatibility cases |
@@ -751,7 +754,7 @@ The **programmatic API** is critical — teams should be able to spin up a serve
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| DynamoDB expression grammar is complex and underdocumented | Parser bugs, incompatibilities | Fuzz testing, test against real DynamoDB for edge cases |
+| DynamoDB expression grammar is complex and underdocumented | Parser bugs, incompatibilities | Fuzz testing, test against DynamoDB Local for edge cases, and use real AWS spot checks only when behavior is ambiguous |
 | SQLite WAL write contention under heavy parallel writes | Slower than expected | Partition sharding (N SQLite files per table), or use memory backend for tests |
 | `modernc.org/sqlite` performance vs CGo | May be 2-3x slower | Offer build tag for `mattn/go-sqlite3` CGo backend |
 | PartiQL subset differences from SQL parsers | Missing/incorrect edge cases | Start with explicit supported subset, differential tests, then expand |
