@@ -131,9 +131,17 @@ Open-source acceleration strategy:
 - Reuse maintained parser libraries for expression/SQL subset parsing where practical.
 - Keep handwritten logic for the DynamoDB-specific planning and execution path.
 
-### Phase 1: Compatibility Harness + Core CRUD (MVP — ~2-3 weeks)
+### Phase 0: Compatibility Harness + Differential Tests (~2-3 days)
 
-> Goal: Pass the AWS SDK `PutItem` / `GetItem` / `DeleteItem` / `Query` / `Scan` round-trip.
+> Goal: Run identical AWS SDK v2 calls against DynamoDB Local and `dql`, and compare response/error semantics.
+
+- Build the harness first (AWS SDK v2 client + golden/differential checks).
+- Use Testcontainers + `amazon/dynamodb-local` as the baseline runtime.
+- If Docker is unavailable, skip differential checks with a clear setup message while keeping non-differential tests runnable.
+
+### Phase 1: HTTP Dispatch + Table Lifecycle + Memory Backend CRUD (MVP — ~1-2 weeks)
+
+> Goal: Pass the AWS SDK `PutItem` / `GetItem` / `DeleteItem` / `Query` / `Scan` round-trip on the in-memory backend.
 
 #### 4.1 HTTP Layer (`pkg/api/`)
 
@@ -203,9 +211,34 @@ type Engine interface {
 Files:
   pkg/storage/engine.go   — Interface definition
   pkg/storage/types.go    — Opts, Params, Result types
+  pkg/storage/registry.go  — Backend registration/selection
+  pkg/storage/memory/backend.go — In-memory engine for Phase 1 parity + fast tests
 ```
 
-#### 4.5 SQLite Backend (`pkg/storage/sqlite/`)
+#### 4.5 Operation Handlers (`pkg/handlers/`)
+
+One file per core DynamoDB API operation (expanded in later phases):
+
+```
+Files:
+  pkg/handlers/put_item.go
+  pkg/handlers/get_item.go
+  pkg/handlers/delete_item.go
+  pkg/handlers/update_item.go
+  pkg/handlers/query.go
+  pkg/handlers/scan.go
+  pkg/handlers/create_table.go
+  pkg/handlers/delete_table.go
+  pkg/handlers/describe_table.go
+  pkg/handlers/list_tables.go
+  pkg/handlers/update_table.go
+```
+
+---
+
+### Phase 2: SQLite Backend + Pagination + Index Basics (~1-2 weeks)
+
+#### 4.6 SQLite Backend (`pkg/storage/sqlite/`)
 
 **Schema per table DB:**
 
@@ -256,28 +289,9 @@ Files:
   pkg/storage/sqlite/shard.go       — Partition sharding logic
 ```
 
-#### 4.6 Operation Handlers (`pkg/handlers/`)
-
-One file per DynamoDB API operation:
-
-```
-Files:
-  pkg/handlers/put_item.go
-  pkg/handlers/get_item.go
-  pkg/handlers/delete_item.go
-  pkg/handlers/update_item.go
-  pkg/handlers/query.go
-  pkg/handlers/scan.go
-  pkg/handlers/create_table.go
-  pkg/handlers/delete_table.go
-  pkg/handlers/describe_table.go
-  pkg/handlers/list_tables.go
-  pkg/handlers/update_table.go
-```
-
 ---
 
-### Phase 2: Expressions (~1-2 weeks)
+### Phase 3: Expressions (~1-2 weeks)
 
 DynamoDB has 5 expression types. They all share a similar grammar but are used in different contexts.
 
@@ -309,7 +323,7 @@ Files:
 
 ---
 
-### Phase 3: Batch & Transactions (~1 week)
+### Phase 4: Batch & Transactions (~1 week)
 
 #### 4.8 Batch Operations (`pkg/handlers/`)
 
@@ -335,7 +349,7 @@ Files:
 
 ---
 
-### Phase 4: DynamoDB Streams (~1-2 weeks)
+### Phase 5: DynamoDB Streams (~1-2 weeks)
 
 #### 4.10 Streams Engine (`pkg/streams/`)
 
@@ -363,7 +377,7 @@ The storage engine's write methods return the old item (if applicable). The hand
 
 ---
 
-### Phase 5: PartiQL (~1-2 weeks)
+### Phase 6: PartiQL (~1-2 weeks)
 
 #### 4.11 PartiQL Engine (`pkg/partiql/`)
 
@@ -397,7 +411,7 @@ Files:
 
 ---
 
-### Phase 6: Advanced Features (~2-3 weeks)
+### Phase 7: Advanced Features (~2-3 weeks)
 
 #### 4.12 TTL (`pkg/ttl/`)
 
@@ -582,8 +596,8 @@ Pass criteria for each item:
 
 ### 6.6 Current Phase 0/1 Progress Snapshot
 
-- Completed: compatibility harness (dql vs DynamoDB Local), operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`), memory-backed CRUD, query/scan pagination + count basics, and conditional/update expression support (`ConditionExpression`, `UpdateExpression` with `SET`/`REMOVE`/`ADD` number/`DELETE` string set).
-- In progress: `UpdateTable` stream/GSI stub parity, filtered/projection query/scan semantics, and remaining expression grammar/function parity.
+- Completed: Phase 0 compatibility harness (dql vs DynamoDB Local), operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`/baseline `UpdateTable` stubs), memory-backed CRUD, query/scan pagination + count basics, and conditional/update expression support (`ConditionExpression`, `UpdateExpression` with `SET`/`REMOVE`/`ADD` number+set/`DELETE` set).
+- In progress: remaining Phase 1/compatibility checklist gaps in query/scan parity (full sort key operator coverage, `FilterExpression`, `ProjectionExpression` + `ExpressionAttributeNames`) plus explicit `Query` `Select=COUNT` parity coverage.
 
 ### 6.6.1 Deferred-but-Accepted Expression Gaps (Backlog)
 
