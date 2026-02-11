@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -375,5 +377,185 @@ func TestConditionExpressionAndUpdateExpression(t *testing.T) {
 	})
 	if !errors.As(err, &cfe) {
 		t.Fatalf("expected conditional failure on delete, got: %v", err)
+	}
+}
+
+func TestConditionalPutItemIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	h := testutil.NewHarness(t)
+	client := h.Client
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("phase1_conditional_atomic"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+
+	const workers = 64
+	const rounds = 8
+
+	for round := 0; round < rounds; round++ {
+		var successes int32
+		errCh := make(chan error, workers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(workers)
+
+		for i := 0; i < workers; i++ {
+			go func(worker int) {
+				defer wg.Done()
+				<-start
+
+				_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+					TableName:           aws.String("phase1_conditional_atomic"),
+					ConditionExpression: aws.String("attribute_not_exists(#pk)"),
+					ExpressionAttributeNames: map[string]string{
+						"#pk": "pk",
+					},
+					Item: map[string]types.AttributeValue{
+						"pk":     &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":     &types.AttributeValueMemberS{Value: "item#" + strconv.Itoa(round)},
+						"writer": &types.AttributeValueMemberN{Value: strconv.Itoa(worker)},
+					},
+				})
+				if err == nil {
+					atomic.AddInt32(&successes, 1)
+					return
+				}
+
+				var cfe *types.ConditionalCheckFailedException
+				if errors.As(err, &cfe) {
+					return
+				}
+				errCh <- err
+			}(i)
+		}
+
+		close(start)
+		wg.Wait()
+		close(errCh)
+
+		for callErr := range errCh {
+			t.Fatalf("unexpected put error in round %d: %v", round, callErr)
+		}
+
+		if got := atomic.LoadInt32(&successes); got != 1 {
+			t.Fatalf("conditional put should be atomic in round %d: successes=%d want=1", round, got)
+		}
+	}
+}
+
+func TestConditionalUpdateItemIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	h := testutil.NewHarness(t)
+	client := h.Client
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("phase1_conditional_update_atomic"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+
+	const workers = 64
+	const rounds = 8
+
+	for round := 0; round < rounds; round++ {
+		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String("phase1_conditional_update_atomic"),
+			Item: map[string]types.AttributeValue{
+				"pk":      &types.AttributeValueMemberS{Value: "tenant#1"},
+				"sk":      &types.AttributeValueMemberS{Value: "counter#" + strconv.Itoa(round)},
+				"counter": &types.AttributeValueMemberN{Value: "0"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("seed item failed in round %d: %v", round, err)
+		}
+
+		var successes int32
+		errCh := make(chan error, workers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(workers)
+
+		for i := 0; i < workers; i++ {
+			go func() {
+				defer wg.Done()
+				<-start
+
+				_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+					TableName: aws.String("phase1_conditional_update_atomic"),
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "counter#" + strconv.Itoa(round)},
+					},
+					ConditionExpression: aws.String("#counter = :zero"),
+					UpdateExpression:    aws.String("ADD #counter :one"),
+					ExpressionAttributeNames: map[string]string{
+						"#counter": "counter",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":zero": &types.AttributeValueMemberN{Value: "0"},
+						":one":  &types.AttributeValueMemberN{Value: "1"},
+					},
+				})
+				if err == nil {
+					atomic.AddInt32(&successes, 1)
+					return
+				}
+
+				var cfe *types.ConditionalCheckFailedException
+				if errors.As(err, &cfe) {
+					return
+				}
+				errCh <- err
+			}()
+		}
+
+		close(start)
+		wg.Wait()
+		close(errCh)
+
+		for callErr := range errCh {
+			t.Fatalf("unexpected update error in round %d: %v", round, callErr)
+		}
+
+		if got := atomic.LoadInt32(&successes); got != 1 {
+			t.Fatalf("conditional update should be atomic in round %d: successes=%d want=1", round, got)
+		}
+
+		gotItem, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName: aws.String("phase1_conditional_update_atomic"),
+			Key: map[string]types.AttributeValue{
+				"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+				"sk": &types.AttributeValueMemberS{Value: "counter#" + strconv.Itoa(round)},
+			},
+		})
+		if err != nil {
+			t.Fatalf("get item failed in round %d: %v", round, err)
+		}
+		if got := gotItem.Item["counter"].(*types.AttributeValueMemberN).Value; got != "1" {
+			t.Fatalf("counter should be 1 in round %d, got=%s", round, got)
+		}
 	}
 }

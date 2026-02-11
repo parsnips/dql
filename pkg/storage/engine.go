@@ -21,12 +21,17 @@ type TableSchema struct {
 	SortKey      string
 }
 
+type ConditionCheck func(existing map[string]types.AttributeValue) (bool, error)
+
 type Engine interface {
 	CreateTable(name string, schema TableSchema) error
 	DeleteTable(name string) error
 	PutItem(table string, item map[string]types.AttributeValue) (map[string]types.AttributeValue, error)
+	PutItemConditional(table string, item map[string]types.AttributeValue, condition ConditionCheck) (map[string]types.AttributeValue, bool, error)
 	GetItem(table string, key map[string]types.AttributeValue) (map[string]types.AttributeValue, error)
 	DeleteItem(table string, key map[string]types.AttributeValue) (map[string]types.AttributeValue, error)
+	DeleteItemConditional(table string, key map[string]types.AttributeValue, condition ConditionCheck) (map[string]types.AttributeValue, bool, error)
+	UpdateItemConditional(table string, key map[string]types.AttributeValue, condition ConditionCheck, update func(item map[string]types.AttributeValue) error) (map[string]types.AttributeValue, map[string]types.AttributeValue, bool, error)
 	Query(table string, in QueryInput) (QueryOutput, error)
 	Scan(table string, in ScanInput) (ScanOutput, error)
 }
@@ -98,19 +103,33 @@ func (m *MemoryEngine) DeleteTable(name string) error {
 }
 
 func (m *MemoryEngine) PutItem(table string, item map[string]types.AttributeValue) (map[string]types.AttributeValue, error) {
+	old, _, err := m.PutItemConditional(table, item, nil)
+	return old, err
+}
+
+func (m *MemoryEngine) PutItemConditional(table string, item map[string]types.AttributeValue, condition ConditionCheck) (map[string]types.AttributeValue, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t, schema, err := m.getTableLocked(table)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	k, err := makeKey(item, schema)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	old := cloneItem(t.items[k])
+	if condition != nil {
+		ok, err := condition(cloneItem(old))
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return old, false, nil
+		}
+	}
 	t.items[k] = cloneItem(item)
-	return old, nil
+	return old, true, nil
 }
 
 func (m *MemoryEngine) GetItem(table string, key map[string]types.AttributeValue) (map[string]types.AttributeValue, error) {
@@ -128,19 +147,75 @@ func (m *MemoryEngine) GetItem(table string, key map[string]types.AttributeValue
 }
 
 func (m *MemoryEngine) DeleteItem(table string, key map[string]types.AttributeValue) (map[string]types.AttributeValue, error) {
+	old, _, err := m.DeleteItemConditional(table, key, nil)
+	return old, err
+}
+
+func (m *MemoryEngine) DeleteItemConditional(table string, key map[string]types.AttributeValue, condition ConditionCheck) (map[string]types.AttributeValue, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	t, schema, err := m.getTableLocked(table)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	k, err := makeKey(key, schema)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	old := cloneItem(t.items[k])
+	if condition != nil {
+		ok, err := condition(cloneItem(old))
+		if err != nil {
+			return nil, false, err
+		}
+		if !ok {
+			return old, false, nil
+		}
+	}
 	delete(t.items, k)
-	return old, nil
+	return old, true, nil
+}
+
+func (m *MemoryEngine) UpdateItemConditional(table string, key map[string]types.AttributeValue, condition ConditionCheck, update func(item map[string]types.AttributeValue) error) (map[string]types.AttributeValue, map[string]types.AttributeValue, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, schema, err := m.getTableLocked(table)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	k, err := makeKey(key, schema)
+	if err != nil {
+		return nil, nil, false, err
+	}
+
+	base := cloneItem(t.items[k])
+	if base == nil {
+		base = cloneItem(key)
+	}
+	old := cloneItem(base)
+
+	if condition != nil {
+		ok, err := condition(cloneItem(old))
+		if err != nil {
+			return nil, nil, false, err
+		}
+		if !ok {
+			return old, nil, false, nil
+		}
+	}
+
+	working := cloneItem(base)
+	if update != nil {
+		if err := update(working); err != nil {
+			return nil, nil, false, err
+		}
+	}
+	newKey, err := makeKey(working, schema)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	t.items[newKey] = cloneItem(working)
+	return old, cloneItem(working), true, nil
 }
 
 func (m *MemoryEngine) Query(table string, in QueryInput) (QueryOutput, error) {

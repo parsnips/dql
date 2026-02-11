@@ -70,39 +70,63 @@ func evaluateConditionAtom(atom string, item map[string]types.AttributeValue, ct
 		_, ok := item[ctx.resolveName(name)]
 		return !ok, nil
 	}
-	if strings.Contains(atom, " <>") || strings.Contains(atom, "<>") {
-		parts := strings.SplitN(atom, "<>", 2)
-		if len(parts) != 2 {
-			return false, fmt.Errorf("ValidationException: invalid ConditionExpression")
-		}
-		name := ctx.resolveName(parts[0])
-		rhs, err := ctx.resolveValue(parts[1])
-		if err != nil {
-			return false, err
-		}
-		lhs := item[name]
-		if lhs == nil {
-			return true, nil
-		}
-		return !attributeValueEqual(lhs, rhs), nil
+	nameToken, op, rhsToken, ok, err := parseConditionComparison(atom)
+	if err != nil {
+		return false, err
 	}
-	if strings.Contains(atom, "=") {
-		parts := strings.SplitN(atom, "=", 2)
-		if len(parts) != 2 {
-			return false, fmt.Errorf("ValidationException: invalid ConditionExpression")
-		}
-		name := ctx.resolveName(parts[0])
-		rhs, err := ctx.resolveValue(parts[1])
+	if ok {
+		name := ctx.resolveName(nameToken)
+		rhs, err := ctx.resolveValue(rhsToken)
 		if err != nil {
 			return false, err
 		}
 		lhs := item[name]
+		if op == "<>" {
+			if lhs == nil {
+				return true, nil
+			}
+			return !attributeValueEqual(lhs, rhs), nil
+		}
 		if lhs == nil {
 			return false, nil
 		}
 		return attributeValueEqual(lhs, rhs), nil
 	}
 	return false, fmt.Errorf("ValidationException: unsupported ConditionExpression")
+}
+
+func parseConditionComparison(atom string) (string, string, string, bool, error) {
+	atom = strings.TrimSpace(atom)
+	if strings.Contains(atom, "<>") {
+		parts := strings.SplitN(atom, "<>", 2)
+		if len(parts) != 2 {
+			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
+		}
+		name := strings.TrimSpace(parts[0])
+		rhs := strings.TrimSpace(parts[1])
+		if name == "" || rhs == "" {
+			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
+		}
+		return name, "<>", rhs, true, nil
+	}
+	for _, unsupported := range []string{">=", "<=", ">", "<"} {
+		if strings.Contains(atom, unsupported) {
+			return "", "", "", false, fmt.Errorf("ValidationException: unsupported ConditionExpression")
+		}
+	}
+	if strings.Contains(atom, "=") {
+		parts := strings.SplitN(atom, "=", 2)
+		if len(parts) != 2 {
+			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
+		}
+		name := strings.TrimSpace(parts[0])
+		rhs := strings.TrimSpace(parts[1])
+		if name == "" || rhs == "" {
+			return "", "", "", false, fmt.Errorf("ValidationException: invalid ConditionExpression")
+		}
+		return name, "=", rhs, true, nil
+	}
+	return "", "", "", false, nil
 }
 
 func applyUpdateExpression(item map[string]types.AttributeValue, expr string, ctx expressionContext) error {
