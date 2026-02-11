@@ -731,7 +731,7 @@ The **programmatic API** is critical — teams should be able to spin up a serve
 | SQLite WAL write contention under heavy parallel writes | Slower than expected | Partition sharding (N SQLite files per table), or use memory backend for tests |
 | `modernc.org/sqlite` performance vs CGo | May be 2-3x slower | Offer build tag for `mattn/go-sqlite3` CGo backend |
 | PartiQL subset differences from SQL parsers | Missing/incorrect edge cases | Start with explicit supported subset, differential tests, then expand |
-| Number type precision (DynamoDB uses 38-digit decimal) | Rounding errors | Use `shopspring/decimal` or similar arbitrary-precision library |
+| Number type precision (DynamoDB uses 38-digit decimal) | Rounding errors | Use `cockroachdb/apd` or similar arbitrary-precision library  |
 
 ---
 
