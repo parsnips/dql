@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"hash/crc32"
+	"io"
 	"net/http"
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -25,8 +28,16 @@ func TestUnknownOperationValidationShape(t *testing.T) {
 	if err != nil {
 		t.Fatalf("raw call failed: %v", err)
 	}
+	defer resp.Body.Close()
 	if got, want := resp.StatusCode, 400; got != want {
 		t.Fatalf("status got=%d want=%d", got, want)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body failed: %v", err)
+	}
+	if got, want := resp.Header.Get("X-Amz-Crc32"), strconv.FormatUint(uint64(crc32.ChecksumIEEE(body)), 10); got != want {
+		t.Fatalf("x-amz-crc32 got=%q want=%q", got, want)
 	}
 }
 
