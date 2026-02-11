@@ -574,6 +574,8 @@ func (s *Server) query(w http.ResponseWriter, payload []byte) {
 	var in struct {
 		TableName                 string            `json:"TableName"`
 		KeyConditionExpression    string            `json:"KeyConditionExpression"`
+		FilterExpression          string            `json:"FilterExpression"`
+		ProjectionExpression      string            `json:"ProjectionExpression"`
 		ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
 		ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
 		ExclusiveStartKey         json.RawMessage   `json:"ExclusiveStartKey"`
@@ -599,10 +601,18 @@ func (s *Server) query(w http.ResponseWriter, payload []byte) {
 	if in.ScanIndexForward != nil {
 		scanForward = *in.ScanIndexForward
 	}
+	ctx := newExpressionContext(in.ExpressionAttributeNames, values)
+	var filter storage.FilterCheck
+	if in.FilterExpression != "" {
+		filter = func(item map[string]types.AttributeValue) (bool, error) {
+			return evaluateConditionExpression(in.FilterExpression, item, ctx)
+		}
+	}
 	out, err := s.engine.Query(in.TableName, storage.QueryInput{
 		KeyConditionExpression:    in.KeyConditionExpression,
 		ExpressionAttributeNames:  in.ExpressionAttributeNames,
 		ExpressionAttributeValues: values,
+		Filter:                    filter,
 		ExclusiveStartKey:         startKey,
 		Limit:                     in.Limit,
 		ScanIndexForward:          scanForward,
@@ -612,17 +622,27 @@ func (s *Server) query(w http.ResponseWriter, payload []byte) {
 		writeTyped(w, err)
 		return
 	}
+	out.Items = applyProjectionExpression(out.Items, in.ProjectionExpression, in.ExpressionAttributeNames)
 	writeCollectionEnvelope(w, out.Items, out.Count, out.ScannedCount, out.LastEvaluatedKey)
 }
 
 func (s *Server) scan(w http.ResponseWriter, payload []byte) {
 	var in struct {
-		TableName         string          `json:"TableName"`
-		ExclusiveStartKey json.RawMessage `json:"ExclusiveStartKey"`
-		Limit             int32           `json:"Limit"`
-		Select            types.Select    `json:"Select"`
+		TableName                 string            `json:"TableName"`
+		FilterExpression          string            `json:"FilterExpression"`
+		ProjectionExpression      string            `json:"ProjectionExpression"`
+		ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+		ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+		ExclusiveStartKey         json.RawMessage   `json:"ExclusiveStartKey"`
+		Limit                     int32             `json:"Limit"`
+		Select                    types.Select      `json:"Select"`
 	}
 	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	values, err := unmarshalOptionalMap(in.ExpressionAttributeValues)
+	if err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
 		return
 	}
@@ -631,7 +651,15 @@ func (s *Server) scan(w http.ResponseWriter, payload []byte) {
 		writeError(w, 400, "ValidationException", err.Error())
 		return
 	}
+	ctx := newExpressionContext(in.ExpressionAttributeNames, values)
+	var filter storage.FilterCheck
+	if in.FilterExpression != "" {
+		filter = func(item map[string]types.AttributeValue) (bool, error) {
+			return evaluateConditionExpression(in.FilterExpression, item, ctx)
+		}
+	}
 	out, err := s.engine.Scan(in.TableName, storage.ScanInput{
+		Filter:            filter,
 		ExclusiveStartKey: startKey,
 		Limit:             in.Limit,
 		Select:            in.Select,
@@ -640,6 +668,7 @@ func (s *Server) scan(w http.ResponseWriter, payload []byte) {
 		writeTyped(w, err)
 		return
 	}
+	out.Items = applyProjectionExpression(out.Items, in.ProjectionExpression, in.ExpressionAttributeNames)
 	writeCollectionEnvelope(w, out.Items, out.Count, out.ScannedCount, out.LastEvaluatedKey)
 }
 
@@ -657,6 +686,40 @@ func unmarshalOptionalMap(raw json.RawMessage) (map[string]types.AttributeValue,
 		return nil, nil
 	}
 	return attributevalue.UnmarshalMapJSON(raw)
+}
+
+func applyProjectionExpression(items []map[string]types.AttributeValue, expr string, names map[string]string) []map[string]types.AttributeValue {
+	expr = strings.TrimSpace(expr)
+	if expr == "" || len(items) == 0 {
+		return items
+	}
+	attrs := strings.Split(expr, ",")
+	resolved := make([]string, 0, len(attrs))
+	for _, attr := range attrs {
+		name := strings.TrimSpace(attr)
+		if strings.HasPrefix(name, "#") && names != nil {
+			if mapped, ok := names[name]; ok {
+				name = mapped
+			}
+		}
+		if name != "" {
+			resolved = append(resolved, name)
+		}
+	}
+	if len(resolved) == 0 {
+		return items
+	}
+	out := make([]map[string]types.AttributeValue, 0, len(items))
+	for _, item := range items {
+		projected := make(map[string]types.AttributeValue, len(resolved))
+		for _, attr := range resolved {
+			if v, ok := item[attr]; ok {
+				projected[attr] = v
+			}
+		}
+		out = append(out, projected)
+	}
+	return out
 }
 
 func writeCollectionEnvelope(w http.ResponseWriter, items []map[string]types.AttributeValue, count, scannedCount int32, last map[string]types.AttributeValue) {

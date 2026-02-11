@@ -277,6 +277,41 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 		}
 	}
 
+	type sortCase struct {
+		name   string
+		expr   string
+		values map[string]types.AttributeValue
+		want   []string
+	}
+	sortCases := []sortCase{
+		{name: "eq", expr: "pk = :pk AND sk = :eq", values: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "tenant#1"}, ":eq": &types.AttributeValueMemberN{Value: "2"}}, want: []string{"2"}},
+		{name: "lt", expr: "pk = :pk AND sk < :v", values: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "tenant#1"}, ":v": &types.AttributeValueMemberN{Value: "3"}}, want: []string{"1", "2"}},
+		{name: "lte", expr: "pk = :pk AND sk <= :v", values: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "tenant#1"}, ":v": &types.AttributeValueMemberN{Value: "3"}}, want: []string{"1", "2", "3"}},
+		{name: "gt", expr: "pk = :pk AND sk > :v", values: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "tenant#1"}, ":v": &types.AttributeValueMemberN{Value: "2"}}, want: []string{"3", "10"}},
+		{name: "gte", expr: "pk = :pk AND sk >= :v", values: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "tenant#1"}, ":v": &types.AttributeValueMemberN{Value: "2"}}, want: []string{"2", "3", "10"}},
+		{name: "between", expr: "pk = :pk AND sk BETWEEN :low AND :high", values: map[string]types.AttributeValue{":pk": &types.AttributeValueMemberS{Value: "tenant#1"}, ":low": &types.AttributeValueMemberN{Value: "2"}, ":high": &types.AttributeValueMemberN{Value: "10"}}, want: []string{"2", "3", "10"}},
+	}
+	for _, tc := range sortCases {
+		t.Run("sort_"+tc.name, func(t *testing.T) {
+			out, err := client.Query(ctx, &dynamodb.QueryInput{
+				TableName:                 aws.String("phase1_qs"),
+				KeyConditionExpression:    aws.String(tc.expr),
+				ExpressionAttributeValues: tc.values,
+			})
+			if err != nil {
+				t.Fatalf("query %s failed: %v", tc.name, err)
+			}
+			if got, want := len(out.Items), len(tc.want); got != want {
+				t.Fatalf("query %s len got=%d want=%d", tc.name, got, want)
+			}
+			for i, want := range tc.want {
+				if got := out.Items[i]["sk"].(*types.AttributeValueMemberN).Value; got != want {
+					t.Fatalf("query %s item %d got=%s want=%s", tc.name, i, got, want)
+				}
+			}
+		})
+	}
+
 	paged, err := client.Query(ctx, &dynamodb.QueryInput{
 		TableName:              aws.String("phase1_qs"),
 		KeyConditionExpression: aws.String("pk = :pk"),
@@ -310,6 +345,47 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 		t.Fatalf("next page items got=%d want=%d", got, want)
 	}
 
+	queryBeginsWithTable := "phase1_qs_str"
+	_, err = client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(queryBeginsWithTable),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create begins_with table failed: %v", err)
+	}
+	for _, item := range []map[string]types.AttributeValue{
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "ord#1"}},
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "ord#2"}},
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberS{Value: "inv#1"}},
+	} {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(queryBeginsWithTable), Item: item})
+		if err != nil {
+			t.Fatalf("put begins_with item failed: %v", err)
+		}
+	}
+	beginsWithOut, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(queryBeginsWithTable),
+		KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :prefix)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":     &types.AttributeValueMemberS{Value: "tenant#1"},
+			":prefix": &types.AttributeValueMemberS{Value: "ord#"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("begins_with query failed: %v", err)
+	}
+	if got, want := len(beginsWithOut.Items), 2; got != want {
+		t.Fatalf("begins_with items got=%d want=%d", got, want)
+	}
+
 	scanOut, err := client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String("phase1_qs")})
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
@@ -327,6 +403,87 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 	}
 	if len(scanCount.Items) != 0 {
 		t.Fatalf("expected no items for Select=COUNT")
+	}
+
+	queryCount, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("phase1_qs"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+		},
+		Select: types.SelectCount,
+	})
+	if err != nil {
+		t.Fatalf("query count failed: %v", err)
+	}
+	if got, want := queryCount.Count, int32(4); got != want {
+		t.Fatalf("query count got=%d want=%d", got, want)
+	}
+	if len(queryCount.Items) != 0 {
+		t.Fatalf("expected no query items for Select=COUNT")
+	}
+
+	scanFiltered, err := client.Scan(ctx, &dynamodb.ScanInput{
+		TableName:            aws.String("phase1_qs"),
+		FilterExpression:     aws.String("#name = :name"),
+		ProjectionExpression: aws.String("#pk, #name"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk":   "pk",
+			"#name": "name",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":name": &types.AttributeValueMemberS{Value: "b"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("scan filtered failed: %v", err)
+	}
+	if got, want := scanFiltered.ScannedCount, int32(5); got != want {
+		t.Fatalf("scan filtered scanned count got=%d want=%d", got, want)
+	}
+	if got, want := scanFiltered.Count, int32(1); got != want {
+		t.Fatalf("scan filtered count got=%d want=%d", got, want)
+	}
+	if got, want := len(scanFiltered.Items), 1; got != want {
+		t.Fatalf("scan filtered items got=%d want=%d", got, want)
+	}
+	if _, ok := scanFiltered.Items[0]["pk"]; !ok {
+		t.Fatalf("expected projected pk field")
+	}
+	if _, ok := scanFiltered.Items[0]["name"]; !ok {
+		t.Fatalf("expected projected name field")
+	}
+	if _, ok := scanFiltered.Items[0]["sk"]; ok {
+		t.Fatalf("did not expect non-projected sk field")
+	}
+
+	queryProjected, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("phase1_qs"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		FilterExpression:       aws.String("#name = :name"),
+		ProjectionExpression:   aws.String("#name"),
+		ExpressionAttributeNames: map[string]string{
+			"#name": "name",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+			":name": &types.AttributeValueMemberS{Value: "c"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("query filtered/projection failed: %v", err)
+	}
+	if got, want := queryProjected.Count, int32(1); got != want {
+		t.Fatalf("query filtered count got=%d want=%d", got, want)
+	}
+	if got, want := len(queryProjected.Items), 1; got != want {
+		t.Fatalf("query projected items got=%d want=%d", got, want)
+	}
+	if _, ok := queryProjected.Items[0]["name"]; !ok {
+		t.Fatalf("expected projected query name field")
+	}
+	if _, ok := queryProjected.Items[0]["sk"]; ok {
+		t.Fatalf("did not expect projected query sk field")
 	}
 }
 

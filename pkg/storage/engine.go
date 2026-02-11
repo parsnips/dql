@@ -22,6 +22,7 @@ type TableSchema struct {
 }
 
 type ConditionCheck func(existing map[string]types.AttributeValue) (bool, error)
+type FilterCheck func(item map[string]types.AttributeValue) (bool, error)
 
 type Engine interface {
 	CreateTable(name string, schema TableSchema) error
@@ -40,6 +41,7 @@ type QueryInput struct {
 	KeyConditionExpression    string
 	ExpressionAttributeNames  map[string]string
 	ExpressionAttributeValues map[string]types.AttributeValue
+	Filter                    FilterCheck
 	ExclusiveStartKey         map[string]types.AttributeValue
 	Limit                     int32
 	ScanIndexForward          bool
@@ -54,6 +56,7 @@ type QueryOutput struct {
 }
 
 type ScanInput struct {
+	Filter            FilterCheck
 	ExclusiveStartKey map[string]types.AttributeValue
 	Limit             int32
 	Select            types.Select
@@ -271,17 +274,35 @@ func (m *MemoryEngine) Query(table string, in QueryInput) (QueryOutput, error) {
 		}
 	}
 
-	limited := rows[start:]
+	evaluated := rows[start:]
+	filtered := make([]row, 0, len(evaluated))
+	scanned := 0
 	var last map[string]types.AttributeValue
-	if in.Limit > 0 && int(in.Limit) < len(limited) {
-		limited = limited[:in.Limit]
-		last = keyFromItem(limited[len(limited)-1].item, schema)
+	for i, r := range evaluated {
+		scanned++
+		matched := true
+		if in.Filter != nil {
+			var err error
+			matched, err = in.Filter(r.item)
+			if err != nil {
+				return QueryOutput{}, err
+			}
+		}
+		if matched {
+			filtered = append(filtered, r)
+		}
+		if in.Limit > 0 && scanned >= int(in.Limit) {
+			if i < len(evaluated)-1 {
+				last = keyFromItem(r.item, schema)
+			}
+			break
+		}
 	}
 
-	out := QueryOutput{Count: int32(len(limited)), ScannedCount: int32(len(rows)), LastEvaluatedKey: last}
+	out := QueryOutput{Count: int32(len(filtered)), ScannedCount: int32(scanned), LastEvaluatedKey: last}
 	if in.Select != types.SelectCount {
-		out.Items = make([]map[string]types.AttributeValue, 0, len(limited))
-		for _, r := range limited {
+		out.Items = make([]map[string]types.AttributeValue, 0, len(filtered))
+		for _, r := range filtered {
 			out.Items = append(out.Items, r.item)
 		}
 	}
@@ -321,17 +342,35 @@ func (m *MemoryEngine) Scan(table string, in ScanInput) (ScanOutput, error) {
 		}
 	}
 
-	limited := rows[start:]
+	evaluated := rows[start:]
+	filtered := make([]row, 0, len(evaluated))
+	scanned := 0
 	var last map[string]types.AttributeValue
-	if in.Limit > 0 && int(in.Limit) < len(limited) {
-		limited = limited[:in.Limit]
-		last = keyFromItem(limited[len(limited)-1].item, schema)
+	for i, r := range evaluated {
+		scanned++
+		matched := true
+		if in.Filter != nil {
+			var err error
+			matched, err = in.Filter(r.item)
+			if err != nil {
+				return ScanOutput{}, err
+			}
+		}
+		if matched {
+			filtered = append(filtered, r)
+		}
+		if in.Limit > 0 && scanned >= int(in.Limit) {
+			if i < len(evaluated)-1 {
+				last = keyFromItem(r.item, schema)
+			}
+			break
+		}
 	}
 
-	out := ScanOutput{Count: int32(len(limited)), ScannedCount: int32(len(rows)), LastEvaluatedKey: last}
+	out := ScanOutput{Count: int32(len(filtered)), ScannedCount: int32(scanned), LastEvaluatedKey: last}
 	if in.Select != types.SelectCount {
-		out.Items = make([]map[string]types.AttributeValue, 0, len(limited))
-		for _, r := range limited {
+		out.Items = make([]map[string]types.AttributeValue, 0, len(filtered))
+		for _, r := range filtered {
 			out.Items = append(out.Items, r.item)
 		}
 	}
@@ -409,7 +448,7 @@ func parseKeyCondition(expr string, schema TableSchema, names map[string]string,
 	for k, v := range names {
 		resolved = strings.ReplaceAll(resolved, k, v)
 	}
-	parts := strings.SplitN(resolved, "AND", 2)
+	parts := strings.SplitN(resolved, " AND ", 2)
 	pkPart := strings.TrimSpace(parts[0])
 	toks := strings.Fields(pkPart)
 	if len(toks) != 3 || toks[0] != schema.PartitionKey || toks[1] != "=" {
