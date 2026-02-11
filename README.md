@@ -582,6 +582,24 @@ Pass criteria for each item:
 - Completed: compatibility harness, operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`), and memory-backed `PutItem`/`GetItem`/`DeleteItem` paths validated by AWS SDK v2 integration tests.
 - In progress: `UpdateItem` parity beyond legacy `AttributeUpdates` flow, conditional expressions, and query/scan coverage.
 
+### 6.7 Differential Harness Runtime (DynamoDB Local via Testcontainers)
+
+Phase 0 differential tests can run without an AWS account by spinning up the official local image:
+
+- Container image: `amazon/dynamodb-local:latest`
+- Orchestration: `github.com/testcontainers/testcontainers-go`
+- Comparison path: run identical AWS SDK calls against:
+  - `dql` in-process `httptest` server
+  - ephemeral DynamoDB Local container endpoint
+
+Environment requirements for CI/dev machines:
+
+- Docker Engine installed
+- Docker daemon running and reachable (default Unix socket or equivalent)
+- Current user allowed to access Docker daemon
+
+If Docker is unavailable, the differential test should be marked as skipped with an explicit setup message; the remaining non-differential integration tests should still run.
+
 ---
 
 ## 7. Project Structure
