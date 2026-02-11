@@ -33,6 +33,14 @@ type scenarioResult struct {
 	CondErr               string
 }
 
+type batchScenarioResult struct {
+	PutUnprocessedCount    int
+	GetUnprocessedKeyCount int
+	DeleteUnprocessedCount int
+	ProjectedItems         []map[string]types.AttributeValue
+	DeletedItem            map[string]types.AttributeValue
+}
+
 type tableSnapshot struct {
 	StreamEnabled  bool
 	StreamViewType types.StreamViewType
@@ -75,6 +83,138 @@ func TestDifferentialDynamoDBLocalAndDQLCoreCRUD(t *testing.T) {
 	}
 	if dqlErr.Type == "" || ddbErr.Type == "" {
 		t.Fatalf("expected __type in unknown-op errors, got dql=%q dynamodb-local=%q", dqlErr.Type, ddbErr.Type)
+	}
+}
+
+func TestDifferentialDynamoDBLocalAndDQLBatchWriteAndBatchGet(t *testing.T) {
+	ctx := context.Background()
+	dql := testutil.NewHarness(t)
+	ddbLocal := testutil.NewDynamoDBLocalHarness(t)
+
+	dqlResult := runBatchWriteGetScenario(t, ctx, dql.Client, "phase1_diff_batch_dql")
+	ddbResult := runBatchWriteGetScenario(t, ctx, ddbLocal.Client, "phase1_diff_batch_local")
+
+	if dqlResult.PutUnprocessedCount != ddbResult.PutUnprocessedCount {
+		t.Fatalf("batch write put unprocessed mismatch dql=%d dynamodb-local=%d", dqlResult.PutUnprocessedCount, ddbResult.PutUnprocessedCount)
+	}
+	if dqlResult.GetUnprocessedKeyCount != ddbResult.GetUnprocessedKeyCount {
+		t.Fatalf("batch get unprocessed keys mismatch dql=%d dynamodb-local=%d", dqlResult.GetUnprocessedKeyCount, ddbResult.GetUnprocessedKeyCount)
+	}
+	if dqlResult.DeleteUnprocessedCount != ddbResult.DeleteUnprocessedCount {
+		t.Fatalf("batch write delete unprocessed mismatch dql=%d dynamodb-local=%d", dqlResult.DeleteUnprocessedCount, ddbResult.DeleteUnprocessedCount)
+	}
+	assertAttributeMapSliceEqualUnordered(t, dqlResult.ProjectedItems, ddbResult.ProjectedItems, "BatchGetItem projected responses")
+	assertAttributeMapEqual(t, dqlResult.DeletedItem, ddbResult.DeletedItem, "GetItem after BatchWriteItem delete")
+}
+
+func runBatchWriteGetScenario(t *testing.T, ctx context.Context, client *dynamodb.Client, tableName string) batchScenarioResult {
+	t.Helper()
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(tableName),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create table %q failed: %v", tableName, err)
+	}
+
+	putOut, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			tableName: {
+				{
+					PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{
+						"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":   &types.AttributeValueMemberS{Value: "item#1"},
+						"name": &types.AttributeValueMemberS{Value: "one"},
+					}},
+				},
+				{
+					PutRequest: &types.PutRequest{Item: map[string]types.AttributeValue{
+						"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":   &types.AttributeValueMemberS{Value: "item#2"},
+						"name": &types.AttributeValueMemberS{Value: "two"},
+					}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("batch write put for %q failed: %v", tableName, err)
+	}
+
+	getOut, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
+		RequestItems: map[string]types.KeysAndAttributes{
+			tableName: {
+				Keys: []map[string]types.AttributeValue{
+					{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "item#1"},
+					},
+					{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "item#2"},
+					},
+					{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "item#missing"},
+					},
+				},
+				ProjectionExpression: aws.String("#pk,#name"),
+				ExpressionAttributeNames: map[string]string{
+					"#pk":   "pk",
+					"#name": "name",
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("batch get for %q failed: %v", tableName, err)
+	}
+
+	delOut, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
+			tableName: {
+				{DeleteRequest: &types.DeleteRequest{Key: map[string]types.AttributeValue{
+					"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+					"sk": &types.AttributeValueMemberS{Value: "item#1"},
+				}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("batch write delete for %q failed: %v", tableName, err)
+	}
+
+	deletedGetOut, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+			"sk": &types.AttributeValueMemberS{Value: "item#1"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("get deleted item for %q failed: %v", tableName, err)
+	}
+
+	_, err = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(tableName)})
+	if err != nil {
+		t.Fatalf("delete table %q failed: %v", tableName, err)
+	}
+
+	return batchScenarioResult{
+		PutUnprocessedCount:    countUnprocessedWriteRequests(putOut.UnprocessedItems),
+		GetUnprocessedKeyCount: countUnprocessedKeys(getOut.UnprocessedKeys),
+		DeleteUnprocessedCount: countUnprocessedWriteRequests(delOut.UnprocessedItems),
+		ProjectedItems:         getOut.Responses[tableName],
+		DeletedItem:            deletedGetOut.Item,
 	}
 }
 
@@ -511,6 +651,46 @@ func assertAttributeMapEqual(t *testing.T, got, want map[string]types.AttributeV
 	}
 }
 
+func assertAttributeMapSliceEqualUnordered(t *testing.T, got, want []map[string]types.AttributeValue, operation string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s item count mismatch got=%d want=%d", operation, len(got), len(want))
+	}
+	used := make([]bool, len(want))
+	for i, gotItem := range got {
+		matched := false
+		for j, wantItem := range want {
+			if used[j] {
+				continue
+			}
+			if attributeMapEqual(gotItem, wantItem) {
+				used[j] = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("%s unmatched item at got[%d]=%#v", operation, i, gotItem)
+		}
+	}
+}
+
+func attributeMapEqual(got, want map[string]types.AttributeValue) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for key, gotAttr := range got {
+		wantAttr, ok := want[key]
+		if !ok {
+			return false
+		}
+		if !attributeValueEqual(gotAttr, wantAttr) {
+			return false
+		}
+	}
+	return true
+}
+
 func attributeValueEqual(a, b types.AttributeValue) bool {
 	switch av := a.(type) {
 	case *types.AttributeValueMemberS:
@@ -559,6 +739,22 @@ func sortedStringsEqual(left, right []string) bool {
 		}
 	}
 	return true
+}
+
+func countUnprocessedWriteRequests(unprocessed map[string][]types.WriteRequest) int {
+	total := 0
+	for _, requests := range unprocessed {
+		total += len(requests)
+	}
+	return total
+}
+
+func countUnprocessedKeys(unprocessed map[string]types.KeysAndAttributes) int {
+	total := 0
+	for _, keys := range unprocessed {
+		total += len(keys.Keys)
+	}
+	return total
 }
 
 func sortedBinaryEqual(left, right [][]byte) bool {
