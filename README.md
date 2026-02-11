@@ -563,12 +563,12 @@ Pass criteria for each item:
 #### Query and Scan
 
 - [x] `Query` with partition key equality
-- [ ] `Query` with full sort key operator parity (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`)
+- [x] `Query` with full sort key operator parity (`=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `begins_with`)
 - [x] `Query` `Limit` + `LastEvaluatedKey` + `ExclusiveStartKey`
 - [x] `Scan` full table
-- [ ] `Scan` filtered scan (`FilterExpression`)
-- [ ] `ProjectionExpression` + `ExpressionAttributeNames`
-- [x] `Select=COUNT` (Scan path covered; Query path implemented but needs explicit parity coverage)
+- [x] `Scan` filtered scan (`FilterExpression`)
+- [x] `ProjectionExpression` + `ExpressionAttributeNames`
+- [x] `Select=COUNT` (Scan + Query parity coverage)
 
 #### Expression Semantics
 
@@ -597,7 +597,7 @@ Pass criteria for each item:
 ### 6.6 Current Phase 0/1 Progress Snapshot
 
 - Completed: Phase 0 compatibility harness (dql vs DynamoDB Local), operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`/baseline `UpdateTable` stubs), memory-backed CRUD, query/scan pagination + count basics, and conditional/update expression support (`ConditionExpression`, `UpdateExpression` with `SET`/`REMOVE`/`ADD` number+set/`DELETE` set).
-- In progress: remaining Phase 1/compatibility checklist gaps in query/scan parity (full sort key operator coverage, `FilterExpression`, `ProjectionExpression` + `ExpressionAttributeNames`) plus explicit `Query` `Select=COUNT` parity coverage.
+- In progress: remaining Phase 1 compatibility gaps outside query/scan parity checklist (batch/transaction/streams/partiql/ttl).
 
 ### 6.6.1 Deferred-but-Accepted Expression Gaps (Backlog)
 
