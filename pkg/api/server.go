@@ -553,6 +553,20 @@ func (s *Server) updateItem(w http.ResponseWriter, payload []byte) {
 		writeItemEnvelope(w, "Attributes", item)
 		return
 	}
+	if in.ReturnValues == types.ReturnValueUpdatedOld {
+		updatedOld, _ := updatedAttributes(old, item)
+		if updatedOld != nil {
+			writeItemEnvelope(w, "Attributes", updatedOld)
+			return
+		}
+	}
+	if in.ReturnValues == types.ReturnValueUpdatedNew {
+		_, updatedNew := updatedAttributes(old, item)
+		if updatedNew != nil {
+			writeItemEnvelope(w, "Attributes", updatedNew)
+			return
+		}
+	}
 	_, _ = w.Write([]byte("{}"))
 }
 
