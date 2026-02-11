@@ -175,10 +175,7 @@ func (m *MemoryEngine) Query(table string, in QueryInput) (QueryOutput, error) {
 		rows = append(rows, row{key: k, item: cloneItem(item)})
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		cmp := strings.Compare(rows[i].key.SK, rows[j].key.SK)
-		if cmp == 0 {
-			cmp = strings.Compare(rows[i].key.PK, rows[j].key.PK)
-		}
+		cmp := compareRowKeys(rows[i], rows[j], schema)
 		if !in.ScanIndexForward {
 			return cmp > 0
 		}
@@ -232,10 +229,7 @@ func (m *MemoryEngine) Scan(table string, in ScanInput) (ScanOutput, error) {
 		rows = append(rows, row{key: k, item: cloneItem(item)})
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].key.PK == rows[j].key.PK {
-			return rows[i].key.SK < rows[j].key.SK
-		}
-		return rows[i].key.PK < rows[j].key.PK
+		return compareRowKeys(rows[i], rows[j], schema) < 0
 	})
 
 	start := 0
@@ -480,4 +474,27 @@ func keyFromItem(item map[string]types.AttributeValue, schema TableSchema) map[s
 		out[schema.SortKey] = item[schema.SortKey]
 	}
 	return out
+}
+
+func compareRowKeys(a, b struct {
+	key  Key
+	item map[string]types.AttributeValue
+}, schema TableSchema) int {
+	if schema.SortKey != "" {
+		cmp, err := compareAttributeValues(a.item[schema.SortKey], b.item[schema.SortKey])
+		if err == nil && cmp != 0 {
+			return cmp
+		}
+	}
+
+	cmp, err := compareAttributeValues(a.item[schema.PartitionKey], b.item[schema.PartitionKey])
+	if err == nil && cmp != 0 {
+		return cmp
+	}
+
+	cmp = strings.Compare(a.key.PK, b.key.PK)
+	if cmp != 0 {
+		return cmp
+	}
+	return strings.Compare(a.key.SK, b.key.SK)
 }
