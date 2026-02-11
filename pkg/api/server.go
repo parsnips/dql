@@ -236,9 +236,12 @@ func (s *Server) updateTable(w http.ResponseWriter, payload []byte) {
 
 func (s *Server) putItem(w http.ResponseWriter, payload []byte) {
 	var in struct {
-		TableName    string            `json:"TableName"`
-		Item         json.RawMessage   `json:"Item"`
-		ReturnValues types.ReturnValue `json:"ReturnValues"`
+		TableName                 string            `json:"TableName"`
+		Item                      json.RawMessage   `json:"Item"`
+		ConditionExpression       string            `json:"ConditionExpression"`
+		ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+		ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+		ReturnValues              types.ReturnValue `json:"ReturnValues"`
 	}
 	if err := json.Unmarshal(payload, &in); err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
@@ -248,6 +251,37 @@ func (s *Server) putItem(w http.ResponseWriter, payload []byte) {
 	if err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
 		return
+	}
+	def, ok := s.catalog.Get(in.TableName)
+	if !ok {
+		writeError(w, 400, "ResourceNotFoundException", "Cannot do operations on a non-existent table")
+		return
+	}
+	values, err := unmarshalOptionalMap(in.ExpressionAttributeValues)
+	if err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	if in.ConditionExpression != "" {
+		key, err := extractKeyFromItem(item, def)
+		if err != nil {
+			writeTyped(w, err)
+			return
+		}
+		existing, err := s.engine.GetItem(in.TableName, key)
+		if err != nil {
+			writeTyped(w, err)
+			return
+		}
+		ok, err := evaluateConditionExpression(in.ConditionExpression, existing, newExpressionContext(in.ExpressionAttributeNames, values))
+		if err != nil {
+			writeTyped(w, err)
+			return
+		}
+		if !ok {
+			writeError(w, 400, "ConditionalCheckFailedException", "The conditional request failed")
+			return
+		}
 	}
 	old, err := s.engine.PutItem(in.TableName, item)
 	if err != nil {
@@ -289,9 +323,12 @@ func (s *Server) getItem(w http.ResponseWriter, payload []byte) {
 
 func (s *Server) deleteItem(w http.ResponseWriter, payload []byte) {
 	var in struct {
-		TableName    string            `json:"TableName"`
-		Key          json.RawMessage   `json:"Key"`
-		ReturnValues types.ReturnValue `json:"ReturnValues"`
+		TableName                 string            `json:"TableName"`
+		Key                       json.RawMessage   `json:"Key"`
+		ConditionExpression       string            `json:"ConditionExpression"`
+		ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+		ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+		ReturnValues              types.ReturnValue `json:"ReturnValues"`
 	}
 	if err := json.Unmarshal(payload, &in); err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
@@ -301,6 +338,27 @@ func (s *Server) deleteItem(w http.ResponseWriter, payload []byte) {
 	if err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
 		return
+	}
+	values, err := unmarshalOptionalMap(in.ExpressionAttributeValues)
+	if err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	if in.ConditionExpression != "" {
+		existing, err := s.engine.GetItem(in.TableName, key)
+		if err != nil {
+			writeTyped(w, err)
+			return
+		}
+		ok, err := evaluateConditionExpression(in.ConditionExpression, existing, newExpressionContext(in.ExpressionAttributeNames, values))
+		if err != nil {
+			writeTyped(w, err)
+			return
+		}
+		if !ok {
+			writeError(w, 400, "ConditionalCheckFailedException", "The conditional request failed")
+			return
+		}
 	}
 	old, err := s.engine.DeleteItem(in.TableName, key)
 	if err != nil {
@@ -316,10 +374,14 @@ func (s *Server) deleteItem(w http.ResponseWriter, payload []byte) {
 
 func (s *Server) updateItem(w http.ResponseWriter, payload []byte) {
 	var in struct {
-		TableName        string                     `json:"TableName"`
-		Key              json.RawMessage            `json:"Key"`
-		AttributeUpdates map[string]json.RawMessage `json:"AttributeUpdates"`
-		ReturnValues     types.ReturnValue          `json:"ReturnValues"`
+		TableName                 string                     `json:"TableName"`
+		Key                       json.RawMessage            `json:"Key"`
+		ConditionExpression       string                     `json:"ConditionExpression"`
+		UpdateExpression          string                     `json:"UpdateExpression"`
+		ExpressionAttributeNames  map[string]string          `json:"ExpressionAttributeNames"`
+		ExpressionAttributeValues json.RawMessage            `json:"ExpressionAttributeValues"`
+		AttributeUpdates          map[string]json.RawMessage `json:"AttributeUpdates"`
+		ReturnValues              types.ReturnValue          `json:"ReturnValues"`
 	}
 	if err := json.Unmarshal(payload, &in); err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
@@ -339,26 +401,50 @@ func (s *Server) updateItem(w http.ResponseWriter, payload []byte) {
 		item = key
 	}
 	old := cloneMap(item)
-	for name, raw := range in.AttributeUpdates {
-		var upd struct {
-			Action types.AttributeAction `json:"Action"`
-			Value  json.RawMessage       `json:"Value"`
-		}
-		if err := json.Unmarshal(raw, &upd); err != nil {
-			writeError(w, 400, "ValidationException", err.Error())
+	values, err := unmarshalOptionalMap(in.ExpressionAttributeValues)
+	if err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	ctx := newExpressionContext(in.ExpressionAttributeNames, values)
+	if in.ConditionExpression != "" {
+		ok, err := evaluateConditionExpression(in.ConditionExpression, old, ctx)
+		if err != nil {
+			writeTyped(w, err)
 			return
 		}
-		if upd.Action == types.AttributeActionDelete {
-			delete(item, name)
-			continue
+		if !ok {
+			writeError(w, 400, "ConditionalCheckFailedException", "The conditional request failed")
+			return
 		}
-		if len(upd.Value) > 0 {
-			m, err := attributevalue.UnmarshalMapJSON([]byte(`{"v":` + string(upd.Value) + `}`))
-			if err != nil {
+	}
+	if in.UpdateExpression != "" {
+		if err := applyUpdateExpression(item, in.UpdateExpression, ctx); err != nil {
+			writeTyped(w, err)
+			return
+		}
+	} else {
+		for name, raw := range in.AttributeUpdates {
+			var upd struct {
+				Action types.AttributeAction `json:"Action"`
+				Value  json.RawMessage       `json:"Value"`
+			}
+			if err := json.Unmarshal(raw, &upd); err != nil {
 				writeError(w, 400, "ValidationException", err.Error())
 				return
 			}
-			item[name] = m["v"]
+			if upd.Action == types.AttributeActionDelete {
+				delete(item, name)
+				continue
+			}
+			if len(upd.Value) > 0 {
+				m, err := attributevalue.UnmarshalMapJSON([]byte(`{"v":` + string(upd.Value) + `}`))
+				if err != nil {
+					writeError(w, 400, "ValidationException", err.Error())
+					return
+				}
+				item[name] = m["v"]
+			}
 		}
 	}
 	if _, err := s.engine.PutItem(in.TableName, item); err != nil {
@@ -471,6 +557,23 @@ func unmarshalOptionalMap(raw json.RawMessage) (map[string]types.AttributeValue,
 		return nil, nil
 	}
 	return attributevalue.UnmarshalMapJSON(raw)
+}
+
+func extractKeyFromItem(item map[string]types.AttributeValue, def table.Definition) (map[string]types.AttributeValue, error) {
+	key := map[string]types.AttributeValue{}
+	pk, ok := item[def.PartitionKey]
+	if !ok {
+		return nil, fmt.Errorf("ValidationException: missing partition key %s", def.PartitionKey)
+	}
+	key[def.PartitionKey] = pk
+	if def.SortKey != "" {
+		sk, ok := item[def.SortKey]
+		if !ok {
+			return nil, fmt.Errorf("ValidationException: missing sort key %s", def.SortKey)
+		}
+		key[def.SortKey] = sk
+	}
+	return key, nil
 }
 
 func writeCollectionEnvelope(w http.ResponseWriter, items []map[string]types.AttributeValue, count, scannedCount int32, last map[string]types.AttributeValue) {

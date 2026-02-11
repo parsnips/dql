@@ -540,11 +540,11 @@ Pass criteria for each item:
 #### Core Item Operations
 
 - [x] `PutItem` (insert/replace)
-- [ ] `PutItem` with `ConditionExpression`
+- [x] `PutItem` with `ConditionExpression`
 - [x] `GetItem` (hit/miss)
 - [x] `DeleteItem` with `ReturnValues=ALL_OLD`
-- [ ] `UpdateItem` with `SET`/`REMOVE`/`ADD`/`DELETE`
-- [ ] `UpdateItem` conditional failure behavior
+- [x] `UpdateItem` with `SET`/`REMOVE`/`ADD`/`DELETE`
+- [x] `UpdateItem` conditional failure behavior
 
 #### Query and Scan
 

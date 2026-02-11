@@ -273,3 +273,107 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 		t.Fatalf("expected no items for Select=COUNT")
 	}
 }
+
+func TestConditionExpressionAndUpdateExpression(t *testing.T) {
+	ctx := context.Background()
+	h := testutil.NewHarness(t)
+	client := h.Client
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("phase1_expr"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String("phase1_expr"),
+		Item: map[string]types.AttributeValue{
+			"pk":      &types.AttributeValueMemberS{Value: "t#1"},
+			"sk":      &types.AttributeValueMemberS{Value: "u#1"},
+			"counter": &types.AttributeValueMemberN{Value: "1"},
+			"tags":    &types.AttributeValueMemberSS{Value: []string{"a", "b", "c"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+
+	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName:           aws.String("phase1_expr"),
+		ConditionExpression: aws.String("attribute_not_exists(#pk)"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk": "pk",
+		},
+		Item: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "t#1"},
+			"sk": &types.AttributeValueMemberS{Value: "u#1"},
+		},
+	})
+	var cfe *types.ConditionalCheckFailedException
+	if !errors.As(err, &cfe) {
+		t.Fatalf("expected conditional failure, got: %v", err)
+	}
+
+	upd, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String("phase1_expr"),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "t#1"},
+			"sk": &types.AttributeValueMemberS{Value: "u#1"},
+		},
+		ConditionExpression: aws.String("#counter = :current"),
+		UpdateExpression:    aws.String("SET #name = :name REMOVE #old ADD #counter :inc DELETE #tags :deleteTags"),
+		ExpressionAttributeNames: map[string]string{
+			"#counter": "counter",
+			"#name":    "name",
+			"#old":     "old_attr",
+			"#tags":    "tags",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":current":    &types.AttributeValueMemberN{Value: "1"},
+			":name":       &types.AttributeValueMemberS{Value: "alice"},
+			":inc":        &types.AttributeValueMemberN{Value: "2"},
+			":deleteTags": &types.AttributeValueMemberSS{Value: []string{"a", "x"}},
+		},
+		ReturnValues: types.ReturnValueAllNew,
+	})
+	if err != nil {
+		t.Fatalf("update expression failed: %v", err)
+	}
+	if got := upd.Attributes["counter"].(*types.AttributeValueMemberN).Value; got != "3" {
+		t.Fatalf("counter got=%s want=3", got)
+	}
+	if _, ok := upd.Attributes["old_attr"]; ok {
+		t.Fatalf("old_attr should be removed")
+	}
+	if got := upd.Attributes["name"].(*types.AttributeValueMemberS).Value; got != "alice" {
+		t.Fatalf("name got=%s want=alice", got)
+	}
+	if got := upd.Attributes["tags"].(*types.AttributeValueMemberSS).Value; len(got) != 2 {
+		t.Fatalf("tags should contain 2 items after delete, got=%v", got)
+	}
+
+	_, err = client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:           aws.String("phase1_expr"),
+		ConditionExpression: aws.String("attribute_exists(#missing)"),
+		ExpressionAttributeNames: map[string]string{
+			"#missing": "does_not_exist",
+		},
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: "t#1"},
+			"sk": &types.AttributeValueMemberS{Value: "u#1"},
+		},
+	})
+	if !errors.As(err, &cfe) {
+		t.Fatalf("expected conditional failure on delete, got: %v", err)
+	}
+}
