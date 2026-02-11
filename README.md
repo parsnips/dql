@@ -540,11 +540,11 @@ Pass criteria for each item:
 #### Core Item Operations
 
 - [x] `PutItem` (insert/replace)
-- [ ] `PutItem` with `ConditionExpression`
+- [x] `PutItem` with `ConditionExpression`
 - [x] `GetItem` (hit/miss)
 - [x] `DeleteItem` with `ReturnValues=ALL_OLD`
-- [ ] `UpdateItem` with `SET`/`REMOVE`/`ADD`/`DELETE`
-- [ ] `UpdateItem` conditional failure behavior
+- [x] `UpdateItem` with `SET`/`REMOVE`/`ADD`/`DELETE`
+- [x] `UpdateItem` conditional failure behavior
 
 #### Query and Scan
 
@@ -582,6 +582,19 @@ Pass criteria for each item:
 
 - Completed: compatibility harness, operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`), and memory-backed `PutItem`/`GetItem`/`DeleteItem` paths validated by AWS SDK v2 integration tests.
 - In progress: `UpdateItem` parity beyond legacy `AttributeUpdates` flow, conditional expressions, and query/scan coverage.
+
+### 6.6.1 Deferred-but-Accepted Expression Gaps (Backlog)
+
+These are known parity gaps that are acceptable during current Phase 0/1 progress, but must be closed before expression parity is considered complete.
+
+Target closure: Expression engine phase (`§4.7`, milestone table Phase `3`) unless explicitly re-prioritized.
+
+- [ ] `UpdateExpression` `ADD` set parity: support `SS`/`NS`/`BS` in addition to Number math (`#7`).
+- [ ] `UpdateExpression` `DELETE` set parity: support `NS`/`BS` in addition to `SS` (`#8`).
+- [ ] `ConditionExpression` grammar parity: `OR`/`NOT`, `BETWEEN`, `IN`, `begins_with`, `contains`, `size` (`#9`).
+- [ ] `UpdateItem` `ReturnValues` parity: implement `UPDATED_OLD` and `UPDATED_NEW` (`#10`).
+- [ ] Replace string-splitting expression parsing with lexer/parser + AST-based evaluation (`#11`).
+- [ ] Add focused unit tests for expression parsing/evaluation/update behavior (including malformed expressions and missing-item cases) (`#12`).
 
 ### 6.7 Differential Harness Runtime (DynamoDB Local via Testcontainers)
 
