@@ -67,6 +67,20 @@ func TestTableLifecycleAndCoreCRUD(t *testing.T) {
 		t.Fatalf("unexpected describe output: %#v", descOut.Table)
 	}
 
+	updateTableOut, err := client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String("phase1_items"),
+		StreamSpecification: &types.StreamSpecification{
+			StreamEnabled:  aws.Bool(true),
+			StreamViewType: types.StreamViewTypeNewImage,
+		},
+	})
+	if err != nil {
+		t.Fatalf("update table failed: %v", err)
+	}
+	if updateTableOut.TableDescription == nil || aws.ToString(updateTableOut.TableDescription.TableName) != "phase1_items" {
+		t.Fatalf("unexpected update table output: %#v", updateTableOut.TableDescription)
+	}
+
 	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String("phase1_items"),
 		Item: map[string]types.AttributeValue{
