@@ -98,6 +98,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.listTables(rw, payload)
 	case "DeleteTable":
 		s.deleteTable(rw, payload)
+	case "UpdateTable":
+		s.updateTable(rw, payload)
 	case "PutItem":
 		s.putItem(rw, payload)
 	case "GetItem":
@@ -106,6 +108,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.deleteItem(rw, payload)
 	case "UpdateItem":
 		s.updateItem(rw, payload)
+	case "Query":
+		s.query(rw, payload)
+	case "Scan":
+		s.scan(rw, payload)
 	default:
 		writeError(rw, http.StatusBadRequest, "ValidationException", fmt.Sprintf("Unknown operation %s", parts[1]))
 	}
@@ -206,6 +212,26 @@ func (s *Server) deleteTable(w http.ResponseWriter, payload []byte) {
 	}
 	_ = s.engine.DeleteTable(in.TableName)
 	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": map[string]any{"TableName": def.Name, "TableStatus": types.TableStatusActive}})
+}
+
+func (s *Server) updateTable(w http.ResponseWriter, payload []byte) {
+	var in struct {
+		TableName string `json:"TableName"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	if in.TableName == "" {
+		writeError(w, 400, "ValidationException", "TableName is required")
+		return
+	}
+	def, ok := s.catalog.Get(in.TableName)
+	if !ok {
+		writeError(w, 400, "ResourceNotFoundException", "Cannot do operations on a non-existent table")
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": map[string]any{"TableName": def.Name, "TableStatus": def.Status}})
 }
 
 func (s *Server) putItem(w http.ResponseWriter, payload []byte) {
@@ -350,6 +376,79 @@ func (s *Server) updateItem(w http.ResponseWriter, payload []byte) {
 	_, _ = w.Write([]byte("{}"))
 }
 
+func (s *Server) query(w http.ResponseWriter, payload []byte) {
+	var in struct {
+		TableName                 string            `json:"TableName"`
+		KeyConditionExpression    string            `json:"KeyConditionExpression"`
+		ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+		ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+		ExclusiveStartKey         json.RawMessage   `json:"ExclusiveStartKey"`
+		Limit                     int32             `json:"Limit"`
+		ScanIndexForward          *bool             `json:"ScanIndexForward"`
+		Select                    types.Select      `json:"Select"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	values, err := unmarshalOptionalMap(in.ExpressionAttributeValues)
+	if err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	startKey, err := unmarshalOptionalMap(in.ExclusiveStartKey)
+	if err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	scanForward := true
+	if in.ScanIndexForward != nil {
+		scanForward = *in.ScanIndexForward
+	}
+	out, err := s.engine.Query(in.TableName, storage.QueryInput{
+		KeyConditionExpression:    in.KeyConditionExpression,
+		ExpressionAttributeNames:  in.ExpressionAttributeNames,
+		ExpressionAttributeValues: values,
+		ExclusiveStartKey:         startKey,
+		Limit:                     in.Limit,
+		ScanIndexForward:          scanForward,
+		Select:                    in.Select,
+	})
+	if err != nil {
+		writeTyped(w, err)
+		return
+	}
+	writeCollectionEnvelope(w, out.Items, out.Count, out.ScannedCount, out.LastEvaluatedKey)
+}
+
+func (s *Server) scan(w http.ResponseWriter, payload []byte) {
+	var in struct {
+		TableName         string          `json:"TableName"`
+		ExclusiveStartKey json.RawMessage `json:"ExclusiveStartKey"`
+		Limit             int32           `json:"Limit"`
+		Select            types.Select    `json:"Select"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	startKey, err := unmarshalOptionalMap(in.ExclusiveStartKey)
+	if err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	out, err := s.engine.Scan(in.TableName, storage.ScanInput{
+		ExclusiveStartKey: startKey,
+		Limit:             in.Limit,
+		Select:            in.Select,
+	})
+	if err != nil {
+		writeTyped(w, err)
+		return
+	}
+	writeCollectionEnvelope(w, out.Items, out.Count, out.ScannedCount, out.LastEvaluatedKey)
+}
+
 func writeItemEnvelope(w http.ResponseWriter, key string, item map[string]types.AttributeValue) {
 	b, err := attributevalue.MarshalMapJSON(item)
 	if err != nil {
@@ -365,6 +464,41 @@ func cloneMap(in map[string]types.AttributeValue) map[string]types.AttributeValu
 		out[k] = v
 	}
 	return out
+}
+
+func unmarshalOptionalMap(raw json.RawMessage) (map[string]types.AttributeValue, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	return attributevalue.UnmarshalMapJSON(raw)
+}
+
+func writeCollectionEnvelope(w http.ResponseWriter, items []map[string]types.AttributeValue, count, scannedCount int32, last map[string]types.AttributeValue) {
+	resp := map[string]any{"Count": count, "ScannedCount": scannedCount}
+	if len(items) > 0 {
+		respItems := make([]json.RawMessage, 0, len(items))
+		for _, item := range items {
+			b, err := attributevalue.MarshalMapJSON(item)
+			if err != nil {
+				writeError(w, 500, "InternalServerError", err.Error())
+				return
+			}
+			respItems = append(respItems, b)
+		}
+		resp["Items"] = respItems
+	}
+	if len(last) > 0 {
+		b, err := attributevalue.MarshalMapJSON(last)
+		if err != nil {
+			writeError(w, 500, "InternalServerError", err.Error())
+			return
+		}
+		resp["LastEvaluatedKey"] = json.RawMessage(b)
+	}
+	if _, ok := resp["Items"]; !ok {
+		resp["Items"] = []json.RawMessage{}
+	}
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func writeTyped(w http.ResponseWriter, err error) {

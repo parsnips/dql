@@ -78,6 +78,20 @@ func TestTableLifecycleAndCoreCRUD(t *testing.T) {
 		t.Fatalf("unexpected describe output: %#v", descOut.Table)
 	}
 
+	updateTableOut, err := client.UpdateTable(ctx, &dynamodb.UpdateTableInput{
+		TableName: aws.String("phase1_items"),
+		StreamSpecification: &types.StreamSpecification{
+			StreamEnabled:  aws.Bool(true),
+			StreamViewType: types.StreamViewTypeNewImage,
+		},
+	})
+	if err != nil {
+		t.Fatalf("update table failed: %v", err)
+	}
+	if updateTableOut.TableDescription == nil || aws.ToString(updateTableOut.TableDescription.TableName) != "phase1_items" {
+		t.Fatalf("unexpected update table output: %#v", updateTableOut.TableDescription)
+	}
+
 	_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String("phase1_items"),
 		Item: map[string]types.AttributeValue{
@@ -147,5 +161,115 @@ func TestTableLifecycleAndCoreCRUD(t *testing.T) {
 	var nfe *types.ResourceNotFoundException
 	if !errors.As(err, &nfe) {
 		t.Fatalf("expected resource not found, got: %v", err)
+	}
+}
+
+func TestQueryAndScanRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	h := testutil.NewHarness(t)
+	client := h.Client
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String("phase1_qs"),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeN},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create table failed: %v", err)
+	}
+
+	items := []map[string]types.AttributeValue{
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberN{Value: "1"}, "name": &types.AttributeValueMemberS{Value: "a"}},
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberN{Value: "2"}, "name": &types.AttributeValueMemberS{Value: "b"}},
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberN{Value: "3"}, "name": &types.AttributeValueMemberS{Value: "c"}},
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#2"}, "sk": &types.AttributeValueMemberN{Value: "1"}, "name": &types.AttributeValueMemberS{Value: "d"}},
+	}
+	for _, item := range items {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String("phase1_qs"), Item: item})
+		if err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+
+	queryOut, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("phase1_qs"),
+		KeyConditionExpression: aws.String("#pk = :pk AND #sk >= :min"),
+		ExpressionAttributeNames: map[string]string{
+			"#pk": "pk",
+			"#sk": "sk",
+		},
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk":  &types.AttributeValueMemberS{Value: "tenant#1"},
+			":min": &types.AttributeValueMemberN{Value: "2"},
+		},
+		ScanIndexForward: aws.Bool(false),
+	})
+	if err != nil {
+		t.Fatalf("query failed: %v", err)
+	}
+	if got, want := len(queryOut.Items), 2; got != want {
+		t.Fatalf("query items got=%d want=%d", got, want)
+	}
+	if got := queryOut.Items[0]["sk"].(*types.AttributeValueMemberN).Value; got != "3" {
+		t.Fatalf("expected descending sort, first sk=%s", got)
+	}
+
+	paged, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("phase1_qs"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+		},
+		Limit: aws.Int32(2),
+	})
+	if err != nil {
+		t.Fatalf("paged query failed: %v", err)
+	}
+	if got, want := len(paged.Items), 2; got != want {
+		t.Fatalf("paged query items got=%d want=%d", got, want)
+	}
+	if len(paged.LastEvaluatedKey) == 0 {
+		t.Fatalf("expected LastEvaluatedKey for paged query")
+	}
+
+	next, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("phase1_qs"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+		},
+		ExclusiveStartKey: paged.LastEvaluatedKey,
+	})
+	if err != nil {
+		t.Fatalf("next page query failed: %v", err)
+	}
+	if got, want := len(next.Items), 1; got != want {
+		t.Fatalf("next page items got=%d want=%d", got, want)
+	}
+
+	scanOut, err := client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String("phase1_qs")})
+	if err != nil {
+		t.Fatalf("scan failed: %v", err)
+	}
+	if got, want := len(scanOut.Items), 4; got != want {
+		t.Fatalf("scan items got=%d want=%d", got, want)
+	}
+
+	scanCount, err := client.Scan(ctx, &dynamodb.ScanInput{TableName: aws.String("phase1_qs"), Select: types.SelectCount})
+	if err != nil {
+		t.Fatalf("scan count failed: %v", err)
+	}
+	if got, want := scanCount.Count, int32(4); got != want {
+		t.Fatalf("scan count got=%d want=%d", got, want)
+	}
+	if len(scanCount.Items) != 0 {
+		t.Fatalf("expected no items for Select=COUNT")
 	}
 }
