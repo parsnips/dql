@@ -41,6 +41,17 @@ type batchScenarioResult struct {
 	DeletedItem            map[string]types.AttributeValue
 }
 
+type txScenarioResult struct {
+	GuardAfterSuccess      map[string]types.AttributeValue
+	PrimaryAfterSuccess    map[string]types.AttributeValue
+	CreatedAfterSuccess    map[string]types.AttributeValue
+	RemovedAfterSuccess    map[string]types.AttributeValue
+	PrimaryAfterRollback   map[string]types.AttributeValue
+	RollbackPutAfterFailed map[string]types.AttributeValue
+	KeepAfterRollback      map[string]types.AttributeValue
+	RollbackErrCode        string
+}
+
 type tableSnapshot struct {
 	StreamEnabled  bool
 	StreamViewType types.StreamViewType
@@ -105,6 +116,28 @@ func TestDifferentialDynamoDBLocalAndDQLBatchWriteAndBatchGet(t *testing.T) {
 	}
 	assertAttributeMapSliceEqualUnordered(t, dqlResult.ProjectedItems, ddbResult.ProjectedItems, "BatchGetItem projected responses")
 	assertAttributeMapEqual(t, dqlResult.DeletedItem, ddbResult.DeletedItem, "GetItem after BatchWriteItem delete")
+}
+
+func TestDifferentialDynamoDBLocalAndDQLTransactWriteItems(t *testing.T) {
+	ctx := context.Background()
+	dql := testutil.NewHarness(t)
+	ddbLocal := testutil.NewDynamoDBLocalHarness(t)
+
+	dqlResult := runTransactWriteItemsScenario(t, ctx, dql.Client, "phase1_diff_tx_dql")
+	ddbResult := runTransactWriteItemsScenario(t, ctx, ddbLocal.Client, "phase1_diff_tx_local")
+
+	assertMaybeItemEqual(t, dqlResult.GuardAfterSuccess, ddbResult.GuardAfterSuccess, "TransactWriteItems guard item after successful transaction")
+	assertMaybeItemEqual(t, dqlResult.PrimaryAfterSuccess, ddbResult.PrimaryAfterSuccess, "TransactWriteItems updated item after successful transaction")
+	assertMaybeItemEqual(t, dqlResult.CreatedAfterSuccess, ddbResult.CreatedAfterSuccess, "TransactWriteItems put item after successful transaction")
+	assertMaybeItemEqual(t, dqlResult.RemovedAfterSuccess, ddbResult.RemovedAfterSuccess, "TransactWriteItems deleted item should be absent after successful transaction")
+
+	if dqlResult.RollbackErrCode != ddbResult.RollbackErrCode {
+		t.Fatalf("TransactWriteItems rollback error code mismatch dql=%q dynamodb-local=%q", dqlResult.RollbackErrCode, ddbResult.RollbackErrCode)
+	}
+
+	assertMaybeItemEqual(t, dqlResult.PrimaryAfterRollback, ddbResult.PrimaryAfterRollback, "TransactWriteItems rollback should preserve updated item")
+	assertMaybeItemEqual(t, dqlResult.RollbackPutAfterFailed, ddbResult.RollbackPutAfterFailed, "TransactWriteItems rollback should drop staged put")
+	assertMaybeItemEqual(t, dqlResult.KeepAfterRollback, ddbResult.KeepAfterRollback, "TransactWriteItems rollback should undo staged delete")
 }
 
 func runBatchWriteGetScenario(t *testing.T, ctx context.Context, client *dynamodb.Client, tableName string) batchScenarioResult {
@@ -553,6 +586,211 @@ func runCoreCRUDScenario(t *testing.T, ctx context.Context, client *dynamodb.Cli
 	}
 }
 
+func runTransactWriteItemsScenario(t *testing.T, ctx context.Context, client *dynamodb.Client, tableName string) txScenarioResult {
+	t.Helper()
+
+	_, err := client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName: aws.String(tableName),
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("pk"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("sk"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{
+			{AttributeName: aws.String("pk"), KeyType: types.KeyTypeHash},
+			{AttributeName: aws.String("sk"), KeyType: types.KeyTypeRange},
+		},
+		BillingMode: types.BillingModePayPerRequest,
+	})
+	if err != nil {
+		t.Fatalf("create transact table %q failed: %v", tableName, err)
+	}
+
+	for _, item := range []map[string]types.AttributeValue{
+		{
+			"pk":     &types.AttributeValueMemberS{Value: "tenant#1"},
+			"sk":     &types.AttributeValueMemberS{Value: "guard"},
+			"status": &types.AttributeValueMemberS{Value: "ready"},
+		},
+		{
+			"pk":      &types.AttributeValueMemberS{Value: "tenant#1"},
+			"sk":      &types.AttributeValueMemberS{Value: "primary"},
+			"status":  &types.AttributeValueMemberS{Value: "pending"},
+			"version": &types.AttributeValueMemberN{Value: "1"},
+		},
+		{
+			"pk":    &types.AttributeValueMemberS{Value: "tenant#1"},
+			"sk":    &types.AttributeValueMemberS{Value: "remove-me"},
+			"state": &types.AttributeValueMemberS{Value: "stale"},
+		},
+		{
+			"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+			"sk":   &types.AttributeValueMemberS{Value: "keep-me"},
+			"kind": &types.AttributeValueMemberS{Value: "guarded"},
+		},
+	} {
+		_, err = client.PutItem(ctx, &dynamodb.PutItemInput{
+			TableName: aws.String(tableName),
+			Item:      item,
+		})
+		if err != nil {
+			t.Fatalf("seed transact item in %q failed: %v", tableName, err)
+		}
+	}
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				ConditionCheck: &types.ConditionCheck{
+					TableName: aws.String(tableName),
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "guard"},
+					},
+					ConditionExpression: aws.String("#status = :ready"),
+					ExpressionAttributeNames: map[string]string{
+						"#status": "status",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":ready": &types.AttributeValueMemberS{Value: "ready"},
+					},
+				},
+			},
+			{
+				Update: &types.Update{
+					TableName: aws.String(tableName),
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "primary"},
+					},
+					UpdateExpression: aws.String("SET #status = :committed, #version = :v2"),
+					ExpressionAttributeNames: map[string]string{
+						"#status":  "status",
+						"#version": "version",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":committed": &types.AttributeValueMemberS{Value: "committed"},
+						":v2":        &types.AttributeValueMemberN{Value: "2"},
+					},
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName: aws.String(tableName),
+					Item: map[string]types.AttributeValue{
+						"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":   &types.AttributeValueMemberS{Value: "created"},
+						"kind": &types.AttributeValueMemberS{Value: "audit"},
+					},
+				},
+			},
+			{
+				Delete: &types.Delete{
+					TableName: aws.String(tableName),
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "remove-me"},
+					},
+					ConditionExpression: aws.String("#state = :stale"),
+					ExpressionAttributeNames: map[string]string{
+						"#state": "state",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":stale": &types.AttributeValueMemberS{Value: "stale"},
+					},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("transact write success path in %q failed: %v", tableName, err)
+	}
+
+	guardAfterSuccess := mustGetItem(t, ctx, client, tableName, "tenant#1", "guard")
+	primaryAfterSuccess := mustGetItem(t, ctx, client, tableName, "tenant#1", "primary")
+	createdAfterSuccess := mustGetItem(t, ctx, client, tableName, "tenant#1", "created")
+	removedAfterSuccess := mustGetItem(t, ctx, client, tableName, "tenant#1", "remove-me")
+
+	_, err = client.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		TransactItems: []types.TransactWriteItem{
+			{
+				Update: &types.Update{
+					TableName: aws.String(tableName),
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "primary"},
+					},
+					UpdateExpression: aws.String("SET #status = :rollbackAttempt"),
+					ExpressionAttributeNames: map[string]string{
+						"#status": "status",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":rollbackAttempt": &types.AttributeValueMemberS{Value: "should-not-stick"},
+					},
+				},
+			},
+			{
+				Put: &types.Put{
+					TableName: aws.String(tableName),
+					Item: map[string]types.AttributeValue{
+						"pk":   &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk":   &types.AttributeValueMemberS{Value: "rollback-created"},
+						"kind": &types.AttributeValueMemberS{Value: "rollback"},
+					},
+				},
+			},
+			{
+				Delete: &types.Delete{
+					TableName: aws.String(tableName),
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "keep-me"},
+					},
+				},
+			},
+			{
+				ConditionCheck: &types.ConditionCheck{
+					TableName: aws.String(tableName),
+					Key: map[string]types.AttributeValue{
+						"pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+						"sk": &types.AttributeValueMemberS{Value: "guard"},
+					},
+					ConditionExpression: aws.String("#status = :wrong"),
+					ExpressionAttributeNames: map[string]string{
+						"#status": "status",
+					},
+					ExpressionAttributeValues: map[string]types.AttributeValue{
+						":wrong": &types.AttributeValueMemberS{Value: "not-ready"},
+					},
+				},
+			},
+		},
+	})
+	var tce *types.TransactionCanceledException
+	if !errors.As(err, &tce) {
+		t.Fatalf("expected transaction canceled in %q, got: %v", tableName, err)
+	}
+
+	primaryAfterRollback := mustGetItem(t, ctx, client, tableName, "tenant#1", "primary")
+	rollbackPutAfterFailed := mustGetItem(t, ctx, client, tableName, "tenant#1", "rollback-created")
+	keepAfterRollback := mustGetItem(t, ctx, client, tableName, "tenant#1", "keep-me")
+
+	_, err = client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(tableName)})
+	if err != nil {
+		t.Fatalf("delete transact table %q failed: %v", tableName, err)
+	}
+
+	return txScenarioResult{
+		GuardAfterSuccess:      guardAfterSuccess,
+		PrimaryAfterSuccess:    primaryAfterSuccess,
+		CreatedAfterSuccess:    createdAfterSuccess,
+		RemovedAfterSuccess:    removedAfterSuccess,
+		PrimaryAfterRollback:   primaryAfterRollback,
+		RollbackPutAfterFailed: rollbackPutAfterFailed,
+		KeepAfterRollback:      keepAfterRollback,
+		RollbackErrCode:        tce.ErrorCode(),
+	}
+}
+
 func tableSnapshotFromDescription(desc *types.TableDescription) tableSnapshot {
 	snap := tableSnapshot{GSIStatuses: map[string]types.IndexStatus{}}
 	if desc == nil {
@@ -675,6 +913,14 @@ func assertAttributeMapSliceEqualUnordered(t *testing.T, got, want []map[string]
 	}
 }
 
+func assertMaybeItemEqual(t *testing.T, got, want map[string]types.AttributeValue, operation string) {
+	t.Helper()
+	if len(got) == 0 && len(want) == 0 {
+		return
+	}
+	assertAttributeMapEqual(t, got, want, operation)
+}
+
 func attributeMapEqual(got, want map[string]types.AttributeValue) bool {
 	if len(got) != len(want) {
 		return false
@@ -779,6 +1025,22 @@ func sortedBinaryEqual(left, right [][]byte) bool {
 type rawError struct {
 	StatusCode int
 	Type       string
+}
+
+func mustGetItem(t *testing.T, ctx context.Context, client *dynamodb.Client, tableName, pk, sk string) map[string]types.AttributeValue {
+	t.Helper()
+
+	out, err := client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(tableName),
+		Key: map[string]types.AttributeValue{
+			"pk": &types.AttributeValueMemberS{Value: pk},
+			"sk": &types.AttributeValueMemberS{Value: sk},
+		},
+	})
+	if err != nil {
+		t.Fatalf("get item %q/%q from %q failed: %v", pk, sk, tableName, err)
+	}
+	return out.Item
 }
 
 func unknownOperationResponse(t *testing.T, endpoint string, client *http.Client) rawError {
