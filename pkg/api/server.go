@@ -119,9 +119,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createTable(w http.ResponseWriter, payload []byte) {
 	var in struct {
-		AttributeDefinitions []types.AttributeDefinition `json:"AttributeDefinitions"`
-		TableName            string                      `json:"TableName"`
-		KeySchema            []types.KeySchemaElement    `json:"KeySchema"`
+		AttributeDefinitions   []types.AttributeDefinition  `json:"AttributeDefinitions"`
+		TableName              string                       `json:"TableName"`
+		KeySchema              []types.KeySchemaElement     `json:"KeySchema"`
+		GlobalSecondaryIndexes []types.GlobalSecondaryIndex `json:"GlobalSecondaryIndexes"`
 	}
 	if err := json.Unmarshal(payload, &in); err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
@@ -144,6 +145,22 @@ func (s *Server) createTable(w http.ResponseWriter, payload []byte) {
 			schema.SortKey, def.SortKey = *ks.AttributeName, *ks.AttributeName
 		}
 	}
+	for _, gsi := range in.GlobalSecondaryIndexes {
+		if gsi.IndexName == nil {
+			continue
+		}
+		if def.GlobalIndexes == nil {
+			def.GlobalIndexes = map[string]types.GlobalSecondaryIndexDescription{}
+		}
+		desc := types.GlobalSecondaryIndexDescription{IndexName: gsi.IndexName, IndexStatus: types.IndexStatusActive}
+		for _, ks := range gsi.KeySchema {
+			desc.KeySchema = append(desc.KeySchema, types.KeySchemaElement{AttributeName: ks.AttributeName, KeyType: ks.KeyType})
+		}
+		if gsi.Projection != nil {
+			desc.Projection = gsi.Projection
+		}
+		def.GlobalIndexes[*gsi.IndexName] = desc
+	}
 	if schema.PartitionKey == "" {
 		writeError(w, 400, "ValidationException", "partition key required")
 		return
@@ -156,7 +173,8 @@ func (s *Server) createTable(w http.ResponseWriter, payload []byte) {
 		writeTyped(w, err)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": map[string]any{"TableName": in.TableName, "TableStatus": types.TableStatusActive}})
+	def, _ = s.catalog.Get(in.TableName)
+	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": tableDescription(def)})
 }
 
 func (s *Server) describeTable(w http.ResponseWriter, payload []byte) {
@@ -172,15 +190,7 @@ func (s *Server) describeTable(w http.ResponseWriter, payload []byte) {
 		writeError(w, 400, "ResourceNotFoundException", "Cannot do operations on a non-existent table")
 		return
 	}
-	keySchema := []map[string]any{{"AttributeName": def.PartitionKey, "KeyType": types.KeyTypeHash}}
-	if def.SortKey != "" {
-		keySchema = append(keySchema, map[string]any{"AttributeName": def.SortKey, "KeyType": types.KeyTypeRange})
-	}
-	attrDefs := make([]map[string]any, 0, len(def.AttributeTypes))
-	for k, v := range def.AttributeTypes {
-		attrDefs = append(attrDefs, map[string]any{"AttributeName": k, "AttributeType": v})
-	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"Table": map[string]any{"TableName": def.Name, "TableStatus": def.Status, "KeySchema": keySchema, "AttributeDefinitions": attrDefs}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"Table": tableDescription(def)})
 }
 
 func (s *Server) listTables(w http.ResponseWriter, payload []byte) {
@@ -216,7 +226,9 @@ func (s *Server) deleteTable(w http.ResponseWriter, payload []byte) {
 
 func (s *Server) updateTable(w http.ResponseWriter, payload []byte) {
 	var in struct {
-		TableName string `json:"TableName"`
+		TableName                   string                             `json:"TableName"`
+		StreamSpecification         *types.StreamSpecification         `json:"StreamSpecification"`
+		GlobalSecondaryIndexUpdates []types.GlobalSecondaryIndexUpdate `json:"GlobalSecondaryIndexUpdates"`
 	}
 	if err := json.Unmarshal(payload, &in); err != nil {
 		writeError(w, 400, "ValidationException", err.Error())
@@ -226,12 +238,104 @@ func (s *Server) updateTable(w http.ResponseWriter, payload []byte) {
 		writeError(w, 400, "ValidationException", "TableName is required")
 		return
 	}
-	def, ok := s.catalog.Get(in.TableName)
-	if !ok {
-		writeError(w, 400, "ResourceNotFoundException", "Cannot do operations on a non-existent table")
+	def, err := s.catalog.Update(in.TableName, func(def *table.Definition) error {
+		if in.StreamSpecification != nil {
+			if in.StreamSpecification.StreamEnabled == nil {
+				return fmt.Errorf("ValidationException: StreamSpecification.StreamEnabled must be set")
+			}
+			if !*in.StreamSpecification.StreamEnabled {
+				def.StreamSpec = nil
+			} else {
+				view := in.StreamSpecification.StreamViewType
+				if view == "" {
+					view = types.StreamViewTypeNewImage
+				}
+				def.StreamSpec = &types.StreamSpecification{StreamEnabled: in.StreamSpecification.StreamEnabled, StreamViewType: view}
+			}
+		}
+
+		if len(in.GlobalSecondaryIndexUpdates) > 0 {
+			if def.GlobalIndexes == nil {
+				def.GlobalIndexes = map[string]types.GlobalSecondaryIndexDescription{}
+			}
+			for _, upd := range in.GlobalSecondaryIndexUpdates {
+				switch {
+				case upd.Create != nil:
+					if upd.Create.IndexName == nil {
+						return fmt.Errorf("ValidationException: GlobalSecondaryIndexUpdates.Create.IndexName is required")
+					}
+					name := *upd.Create.IndexName
+					desc := types.GlobalSecondaryIndexDescription{IndexName: upd.Create.IndexName, IndexStatus: types.IndexStatusActive}
+					for _, ks := range upd.Create.KeySchema {
+						desc.KeySchema = append(desc.KeySchema, types.KeySchemaElement{AttributeName: ks.AttributeName, KeyType: ks.KeyType})
+					}
+					if upd.Create.Projection != nil {
+						desc.Projection = upd.Create.Projection
+					}
+					def.GlobalIndexes[name] = desc
+				case upd.Delete != nil:
+					if upd.Delete.IndexName == nil {
+						return fmt.Errorf("ValidationException: GlobalSecondaryIndexUpdates.Delete.IndexName is required")
+					}
+					delete(def.GlobalIndexes, *upd.Delete.IndexName)
+				case upd.Update != nil:
+					if upd.Update.IndexName == nil {
+						return fmt.Errorf("ValidationException: GlobalSecondaryIndexUpdates.Update.IndexName is required")
+					}
+					name := *upd.Update.IndexName
+					desc, ok := def.GlobalIndexes[name]
+					if !ok {
+						desc = types.GlobalSecondaryIndexDescription{IndexName: upd.Update.IndexName}
+					}
+					desc.IndexStatus = types.IndexStatusActive
+					def.GlobalIndexes[name] = desc
+				}
+			}
+		}
+		def.Status = types.TableStatusActive
+		return nil
+	})
+	if err != nil {
+		writeTyped(w, err)
 		return
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": map[string]any{"TableName": def.Name, "TableStatus": def.Status}})
+	_ = json.NewEncoder(w).Encode(map[string]any{"TableDescription": tableDescription(def)})
+}
+
+func tableDescription(def table.Definition) map[string]any {
+	keySchema := []map[string]any{{"AttributeName": def.PartitionKey, "KeyType": types.KeyTypeHash}}
+	if def.SortKey != "" {
+		keySchema = append(keySchema, map[string]any{"AttributeName": def.SortKey, "KeyType": types.KeyTypeRange})
+	}
+	attrDefs := make([]map[string]any, 0, len(def.AttributeTypes))
+	for k, v := range def.AttributeTypes {
+		attrDefs = append(attrDefs, map[string]any{"AttributeName": k, "AttributeType": v})
+	}
+	tableDesc := map[string]any{"TableName": def.Name, "TableStatus": def.Status, "KeySchema": keySchema, "AttributeDefinitions": attrDefs}
+	if def.StreamSpec != nil && def.StreamSpec.StreamEnabled != nil && *def.StreamSpec.StreamEnabled {
+		tableDesc["StreamSpecification"] = map[string]any{"StreamEnabled": true, "StreamViewType": def.StreamSpec.StreamViewType}
+		tableDesc["LatestStreamLabel"] = "dql-local-stream"
+		tableDesc["LatestStreamArn"] = fmt.Sprintf("arn:aws:dynamodb:local:000000000000:table/%s/stream/dql-local-stream", def.Name)
+	}
+	if len(def.GlobalIndexes) > 0 {
+		indexes := make([]map[string]any, 0, len(def.GlobalIndexes))
+		for _, gsi := range def.GlobalIndexes {
+			idx := map[string]any{"IndexName": gsi.IndexName, "IndexStatus": gsi.IndexStatus}
+			if len(gsi.KeySchema) > 0 {
+				idxKeySchema := make([]map[string]any, 0, len(gsi.KeySchema))
+				for _, ks := range gsi.KeySchema {
+					idxKeySchema = append(idxKeySchema, map[string]any{"AttributeName": ks.AttributeName, "KeyType": ks.KeyType})
+				}
+				idx["KeySchema"] = idxKeySchema
+			}
+			if gsi.Projection != nil {
+				idx["Projection"] = gsi.Projection
+			}
+			indexes = append(indexes, idx)
+		}
+		tableDesc["GlobalSecondaryIndexes"] = indexes
+	}
+	return tableDesc
 }
 
 func (s *Server) putItem(w http.ResponseWriter, payload []byte) {

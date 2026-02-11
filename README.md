@@ -535,7 +535,7 @@ Pass criteria for each item:
 - [x] `DescribeTable`
 - [x] `ListTables` pagination basics
 - [x] `DeleteTable`
-- [ ] `UpdateTable` (stream toggle + basic GSI status transitions/stubs)
+- [x] `UpdateTable` (stream toggle + basic GSI status transitions/stubs)
 
 #### Core Item Operations
 
