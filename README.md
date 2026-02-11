@@ -522,26 +522,26 @@ Pass criteria for each item:
 
 #### Protocol and Error Surface
 
-- [ ] `X-Amz-Target` dispatch for `DynamoDB_20120810.*` operations
-- [ ] `application/x-amz-json-1.0` request/response compatibility
-- [ ] Unknown operation returns DynamoDB-style validation error shape
-- [ ] Validation errors include operation-appropriate `__type`/message conventions
+- [x] `X-Amz-Target` dispatch for `DynamoDB_20120810.*` operations
+- [x] `application/x-amz-json-1.0` request/response compatibility
+- [x] Unknown operation returns DynamoDB-style validation error shape
+- [x] Validation errors include operation-appropriate `__type`/message conventions
 
 #### Table Lifecycle
 
-- [ ] `CreateTable` (HASH only)
-- [ ] `CreateTable` (HASH+RANGE)
-- [ ] `DescribeTable`
-- [ ] `ListTables` pagination basics
-- [ ] `DeleteTable`
+- [x] `CreateTable` (HASH only)
+- [x] `CreateTable` (HASH+RANGE)
+- [x] `DescribeTable`
+- [x] `ListTables` pagination basics
+- [x] `DeleteTable`
 - [ ] `UpdateTable` (stream toggle + basic GSI status transitions/stubs)
 
 #### Core Item Operations
 
-- [ ] `PutItem` (insert/replace)
+- [x] `PutItem` (insert/replace)
 - [ ] `PutItem` with `ConditionExpression`
-- [ ] `GetItem` (hit/miss)
-- [ ] `DeleteItem` with `ReturnValues=ALL_OLD`
+- [x] `GetItem` (hit/miss)
+- [x] `DeleteItem` with `ReturnValues=ALL_OLD`
 - [ ] `UpdateItem` with `SET`/`REMOVE`/`ADD`/`DELETE`
 - [ ] `UpdateItem` conditional failure behavior
 
@@ -575,6 +575,12 @@ Pass criteria for each item:
 - [ ] PartiQL `ExecuteStatement` for `SELECT`/`INSERT`/`UPDATE`/`DELETE` subset
 - [ ] TTL background expiration behavior (including stream emission)
 - [ ] Backup/restore stubs return compatible shapes/status codes
+
+
+### 6.6 Current Phase 0/1 Progress Snapshot
+
+- Completed: compatibility harness, operation dispatch/error surface, table lifecycle (`CreateTable`/`DescribeTable`/`ListTables`/`DeleteTable`), and memory-backed `PutItem`/`GetItem`/`DeleteItem` paths validated by AWS SDK v2 integration tests.
+- In progress: `UpdateItem` parity beyond legacy `AttributeUpdates` flow, conditional expressions, and query/scan coverage.
 
 ---
 
