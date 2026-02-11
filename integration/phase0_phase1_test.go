@@ -189,6 +189,7 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberN{Value: "1"}, "name": &types.AttributeValueMemberS{Value: "a"}},
 		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberN{Value: "2"}, "name": &types.AttributeValueMemberS{Value: "b"}},
 		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberN{Value: "3"}, "name": &types.AttributeValueMemberS{Value: "c"}},
+		{"pk": &types.AttributeValueMemberS{Value: "tenant#1"}, "sk": &types.AttributeValueMemberN{Value: "10"}, "name": &types.AttributeValueMemberS{Value: "e"}},
 		{"pk": &types.AttributeValueMemberS{Value: "tenant#2"}, "sk": &types.AttributeValueMemberN{Value: "1"}, "name": &types.AttributeValueMemberS{Value: "d"}},
 	}
 	for _, item := range items {
@@ -214,11 +215,32 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("query failed: %v", err)
 	}
-	if got, want := len(queryOut.Items), 2; got != want {
+	if got, want := len(queryOut.Items), 3; got != want {
 		t.Fatalf("query items got=%d want=%d", got, want)
 	}
-	if got := queryOut.Items[0]["sk"].(*types.AttributeValueMemberN).Value; got != "3" {
-		t.Fatalf("expected descending sort, first sk=%s", got)
+	desc := []string{"10", "3", "2"}
+	for i, want := range desc {
+		if got := queryOut.Items[i]["sk"].(*types.AttributeValueMemberN).Value; got != want {
+			t.Fatalf("descending order mismatch at %d: got=%s want=%s", i, got, want)
+		}
+	}
+
+	ascending, err := client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String("phase1_qs"),
+		KeyConditionExpression: aws.String("pk = :pk"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: "tenant#1"},
+		},
+		ScanIndexForward: aws.Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("ascending query failed: %v", err)
+	}
+	ordered := []string{"1", "2", "3", "10"}
+	for i, want := range ordered {
+		if got := ascending.Items[i]["sk"].(*types.AttributeValueMemberN).Value; got != want {
+			t.Fatalf("ascending order mismatch at %d: got=%s want=%s", i, got, want)
+		}
 	}
 
 	paged, err := client.Query(ctx, &dynamodb.QueryInput{
@@ -250,7 +272,7 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("next page query failed: %v", err)
 	}
-	if got, want := len(next.Items), 1; got != want {
+	if got, want := len(next.Items), 2; got != want {
 		t.Fatalf("next page items got=%d want=%d", got, want)
 	}
 
@@ -258,7 +280,7 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan failed: %v", err)
 	}
-	if got, want := len(scanOut.Items), 4; got != want {
+	if got, want := len(scanOut.Items), 5; got != want {
 		t.Fatalf("scan items got=%d want=%d", got, want)
 	}
 
@@ -266,7 +288,7 @@ func TestQueryAndScanRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan count failed: %v", err)
 	}
-	if got, want := scanCount.Count, int32(4); got != want {
+	if got, want := scanCount.Count, int32(5); got != want {
 		t.Fatalf("scan count got=%d want=%d", got, want)
 	}
 	if len(scanCount.Items) != 0 {
