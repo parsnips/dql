@@ -112,6 +112,8 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		s.batchWriteItem(rw, payload)
 	case "BatchGetItem":
 		s.batchGetItem(rw, payload)
+	case "TransactWriteItems":
+		s.transactWriteItems(rw, payload)
 	case "Query":
 		s.query(rw, payload)
 	case "Scan":
@@ -683,6 +685,177 @@ func (s *Server) batchGetItem(w http.ResponseWriter, payload []byte) {
 		"Responses":       responses,
 		"UnprocessedKeys": map[string]any{},
 	})
+}
+
+func (s *Server) transactWriteItems(w http.ResponseWriter, payload []byte) {
+	var in struct {
+		TransactItems []struct {
+			Put *struct {
+				TableName                 string            `json:"TableName"`
+				Item                      json.RawMessage   `json:"Item"`
+				ConditionExpression       string            `json:"ConditionExpression"`
+				ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+				ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+			} `json:"Put"`
+			Delete *struct {
+				TableName                 string            `json:"TableName"`
+				Key                       json.RawMessage   `json:"Key"`
+				ConditionExpression       string            `json:"ConditionExpression"`
+				ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+				ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+			} `json:"Delete"`
+			Update *struct {
+				TableName                 string            `json:"TableName"`
+				Key                       json.RawMessage   `json:"Key"`
+				UpdateExpression          string            `json:"UpdateExpression"`
+				ConditionExpression       string            `json:"ConditionExpression"`
+				ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+				ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+			} `json:"Update"`
+			ConditionCheck *struct {
+				TableName                 string            `json:"TableName"`
+				Key                       json.RawMessage   `json:"Key"`
+				ConditionExpression       string            `json:"ConditionExpression"`
+				ExpressionAttributeNames  map[string]string `json:"ExpressionAttributeNames"`
+				ExpressionAttributeValues json.RawMessage   `json:"ExpressionAttributeValues"`
+			} `json:"ConditionCheck"`
+		} `json:"TransactItems"`
+	}
+	if err := json.Unmarshal(payload, &in); err != nil {
+		writeError(w, 400, "ValidationException", err.Error())
+		return
+	}
+	if len(in.TransactItems) == 0 {
+		writeError(w, 400, "ValidationException", "TransactItems is required")
+		return
+	}
+
+	actions := make([]storage.TransactWriteAction, 0, len(in.TransactItems))
+	for _, tx := range in.TransactItems {
+		count := 0
+		if tx.Put != nil {
+			count++
+		}
+		if tx.Delete != nil {
+			count++
+		}
+		if tx.Update != nil {
+			count++
+		}
+		if tx.ConditionCheck != nil {
+			count++
+		}
+		if count != 1 {
+			writeError(w, 400, "ValidationException", "each transaction item must contain exactly one operation")
+			return
+		}
+
+		action := storage.TransactWriteAction{}
+		if tx.Put != nil {
+			put := *tx.Put
+			item, err := attributevalue.UnmarshalMapJSON(put.Item)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			action.Table = put.TableName
+			action.PutItem = item
+			values, err := unmarshalOptionalMap(put.ExpressionAttributeValues)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			if put.ConditionExpression != "" {
+				ctx := newExpressionContext(put.ExpressionAttributeNames, values)
+				action.ConditionCheck = func(existing map[string]types.AttributeValue) (bool, error) {
+					return evaluateConditionExpression(put.ConditionExpression, existing, ctx)
+				}
+			}
+		}
+
+		if tx.Delete != nil {
+			del := *tx.Delete
+			key, err := attributevalue.UnmarshalMapJSON(del.Key)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			action.Table = del.TableName
+			action.DeleteKey = key
+			values, err := unmarshalOptionalMap(del.ExpressionAttributeValues)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			if del.ConditionExpression != "" {
+				ctx := newExpressionContext(del.ExpressionAttributeNames, values)
+				action.ConditionCheck = func(existing map[string]types.AttributeValue) (bool, error) {
+					return evaluateConditionExpression(del.ConditionExpression, existing, ctx)
+				}
+			}
+		}
+
+		if tx.Update != nil {
+			upd := *tx.Update
+			if strings.TrimSpace(upd.UpdateExpression) == "" {
+				writeError(w, 400, "ValidationException", "UpdateExpression is required")
+				return
+			}
+			key, err := attributevalue.UnmarshalMapJSON(upd.Key)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			values, err := unmarshalOptionalMap(upd.ExpressionAttributeValues)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			ctx := newExpressionContext(upd.ExpressionAttributeNames, values)
+			action.Table = upd.TableName
+			action.UpdateKey = key
+			action.Update = func(item map[string]types.AttributeValue) error {
+				return applyUpdateExpression(item, upd.UpdateExpression, ctx)
+			}
+			if upd.ConditionExpression != "" {
+				action.ConditionCheck = func(existing map[string]types.AttributeValue) (bool, error) {
+					return evaluateConditionExpression(upd.ConditionExpression, existing, ctx)
+				}
+			}
+		}
+
+		if tx.ConditionCheck != nil {
+			check := *tx.ConditionCheck
+			if strings.TrimSpace(check.ConditionExpression) == "" {
+				writeError(w, 400, "ValidationException", "ConditionExpression is required")
+				return
+			}
+			key, err := attributevalue.UnmarshalMapJSON(check.Key)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			values, err := unmarshalOptionalMap(check.ExpressionAttributeValues)
+			if err != nil {
+				writeError(w, 400, "ValidationException", err.Error())
+				return
+			}
+			ctx := newExpressionContext(check.ExpressionAttributeNames, values)
+			action.Table = check.TableName
+			action.ConditionKey = key
+			action.ConditionCheck = func(existing map[string]types.AttributeValue) (bool, error) {
+				return evaluateConditionExpression(check.ConditionExpression, existing, ctx)
+			}
+		}
+
+		actions = append(actions, action)
+	}
+
+	if err := s.engine.TransactWriteItems(actions); err != nil {
+		writeTyped(w, err)
+		return
+	}
+	_, _ = w.Write([]byte("{}"))
 }
 
 func (s *Server) query(w http.ResponseWriter, payload []byte) {
